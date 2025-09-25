@@ -13,7 +13,7 @@ from openai import OpenAI
 # =========================
 TRAIN_PATH       = "v_data/done_representatives.jsonl"
 TEST_PATH        = "v_data/test_done_issues.jsonl"
-COMPONENTS_PATH  = "components.json"
+COMPONENTS_PATH  = "v_data/components.json"
 OUT_PREDS_PATH   = "predictions.json"
 
 MODEL            = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
@@ -22,13 +22,11 @@ TRAIN_LIMIT      = 700
 TEST_LIMIT       = 20
 BATCH_SIZE       = 10
 
-# Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("assign-components")
 
-# Load env for OPENAI_API_KEY if using .env file
 load_dotenv()
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]  # required
+OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 
 # =========================
 # Data model
@@ -55,20 +53,11 @@ def read_jsonl(path: str) -> List[Dict[str, Any]]:
 
 def read_components(path: str) -> List[str]:
     """
-    Accepts either:
-      - ["CompA", "CompB", ...]
-      - [{"name":"CompA"}, {"name":"CompB"}, ...]
-      - {"CompA": "123", "CompB": "456", ...}  (mapping name -> id)
+    Read components from a JSON array file.
     """
-    data = json.load(open(path, "r", encoding="utf-8"))
-    if isinstance(data, dict):
-        # components provided as mapping of name -> id; return just names
-        return [str(k) for k in data.keys()]
-    if isinstance(data, list) and data and isinstance(data[0], dict) and "name" in data[0]:
-        return [str(d["name"]) for d in data]
-    if isinstance(data, list) and (not data or isinstance(data[0], str)):
-        return [str(x) for x in data]
-    raise ValueError("components.json must be list[str], list[{name: str}], or dict[name -> id]")
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return data
 
 def normalize_issue(raw: Dict[str, Any], desc_max: int) -> IssueRow:
     key = (raw.get("issue_key") or raw.get("key") or "").strip()
@@ -211,13 +200,6 @@ def evaluate_accuracy(gold_rows: List[IssueRow], preds: List[Dict[str, str]]) ->
 # =========================
 def chunk(xs: List[Any], n: int) -> List[List[Any]]:
     return [xs[i:i+n] for i in range(0, len(xs), n)]
-
-
-def get_idfgh_teams():
-
-
-
-
 
 # =========================
 # Main
