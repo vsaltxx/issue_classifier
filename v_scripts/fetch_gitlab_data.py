@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+"""
+This script fetches the IDFGH components from the GitLab repository and saves them to a JSON file.
+Step 4 in a pipeline: fetch components from GitLab
+"""
 import os
 import json
 import logging

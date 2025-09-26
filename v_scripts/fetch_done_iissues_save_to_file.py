@@ -1,3 +1,8 @@
+#!/usr/bin/env python3
+"""
+This script fetches all done issues from Jira and saves them to a JSONL file.
+Step 1 in a pipeline: fetch all done issues
+"""
 import json
 import os
 from jira import JIRA
@@ -12,7 +17,7 @@ PROJECT_KEY = "IDFGH"
 
 DEFAULT_FIELDS = "summary,description,components"
 def connect_jira() -> JIRA:
-    jira_url = "https://jira.espressif.com:8443/"
+    jira_url = os.environ["JIRA_URL"]
     jira_token = os.environ["JIRA_API_TOKEN"]
     return JIRA(server=jira_url, token_auth=jira_token)
 
@@ -23,7 +28,7 @@ def issue_to_row(issue: JiraIssue) -> Dict[str, Any]:
     return {
         "key": issue.key,
         "summary": f.summary or "",
-        "description": (getattr(f, "description", "") or "")[:300],
+        "description": (getattr(f, "description", "") or ""),
         "components": [c.name for c in comps],
     }
 
@@ -58,13 +63,12 @@ def main() -> None:
     jira = connect_jira()
     issues = fetch_done_issues(jira, f"project = {PROJECT_KEY} AND status = Done AND summary ~ 'GH *'", fields=DEFAULT_FIELDS, require_components=True)
     done_rows = [issue_to_row(i) for i in issues]
-    save_jsonl("done_issues.jsonl", done_rows)
+    save_jsonl("v_data/done_issues.jsonl", done_rows)
     print(f"Saved {len(done_rows)} issues to done_issues.jsonl")
     if done_rows[:1]:
         print("Sample:", json.dumps(done_rows[0], ensure_ascii=False)[:300])
 
 if __name__ == "__main__":
     main()
-
 
 

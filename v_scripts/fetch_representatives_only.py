@@ -1,3 +1,8 @@
+#!/usr/bin/env python3
+"""
+This script fetches representatives only from the Jira and saves them to a JSONL file to reduce the size of the train data.
+Step 3 in a pipeline: fetch representatives only
+"""
 import json
 import os
 from jira import JIRA
@@ -12,7 +17,7 @@ PROJECT_KEY = "IDFGH"
 
 DEFAULT_FIELDS = "summary,description,components"
 def connect_jira() -> JIRA:
-    jira_url = "https://jira.espressif.com:8443/"
+    jira_url = os.environ["JIRA_URL"]
     jira_token = os.environ["JIRA_API_TOKEN"]
     return JIRA(server=jira_url, token_auth=jira_token)
 
@@ -75,7 +80,7 @@ def main() -> None:
 
     all_issues: List[JiraIssue] = []
     # JQL IN list practical limits vary; keep batches small (e.g., 200)
-    for key_batch in chunk_list(issue_keys, 200):
+    for key_batch in chunk_list(issue_keys, 300):
         keys_csv = ", ".join(key_batch)
         jql = f"key in ({keys_csv})"
         batch_issues = fetch_done_issues(
