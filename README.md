@@ -72,6 +72,39 @@ Loaded: 16 teams, 132 component mappings
 2025-10-02 13:21:51,302 INFO LLM extracted patterns for 16 teams
 2025-10-02 13:21:51,303 INFO Saved 559 team hints to v_data/team_hints.json
 
+### 2025-10-02-3 — Optimized Keywords & Build System Rules (teams)
+- **Model:** `gpt-5`
+- **Train/Test:** `100 samples`
+- **Prompt features:** `15 unique keywords per team (240 total), build system disambiguation rules (IDF Core vs IDF Tools), enhanced classification examples, batch parallel processing (5 issues per API call)`
+- **Result:** `accuracy = 0.874`
+- **Observations:** 
+  - Specified instruction how to classify build system from IDF Tools and IDF Core
+  - Reduced the number of keywords to 15 per team (from 559 to 240 total)
+  - Added clear routing rules for component usage vs build system internals
+  - Implemented batch parallel processing for 5x faster API calls (100 issues → 20 API calls)
+
+### 2025-10-02-4 — Enhanced Rules Based on Mismatch Analysis (teams)
+- **Model:** `gpt-5`
+- **Train/Test:** `100 samples`
+- **Prompt features:** `mismatch-driven rule enhancement, strengthened component-first priority, specific component mappings (usb_serial_jtag→Chip Support, tools→IDF Tools), critical build system disambiguation, driver vs power management rules, USB vs serial disambiguation, batch processing (20 issues per API call)`
+- **Result:** `accuracy = 0.874`
+- **Observations:** 
+  - BATCH_SIZE = 20 # Process N issues at once --> a lot faster
+  - Analyzed 12 mismatches from previous run (87.4% accuracy) to identify root causes
+  - Added 5 new rule categories to address: Build System confusion (5 issues), Component mapping gaps (3 issues), Content over component priority (2 issues), Driver/power confusion (1 issue), Language standard placement (1 issue)
+  - Enhanced component-first rule with explicit examples and stronger prioritization
+
+### 2025-10-02-5 — Absolute Component-First Rules (teams)
+- **Model:** `gpt-5`
+- **Train/Test:** `100 samples`
+- **Prompt features:** `absolute component-first rule overriding all description analysis, critical component mappings with exact matches, mandatory driver component rules (all driver_* → Chip Support), strict BLE vs Classic Bluetooth disambiguation, build system override rule, comprehensive component categories`
+- **Result:** `accuracy = 0.926`
+- **Observations:** 
+  - Implemented absolute component field priority over description content
+  - Fixed 5 of 12 previous mismatches, reducing errors from 12 to 7 issues
+  - Significant improvement: 87.4% → 92.6% (+5.2 percentage points)
+  - Remaining 7 mismatches are edge cases requiring deeper analysis
+
 
 
 ## Log template:

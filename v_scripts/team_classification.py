@@ -239,57 +239,65 @@ Analysis Framework:
    - When component field conflicts with description, trust the component
 
 3. APPLY classification rules:
-   - **COMPONENT-FIRST RULE (ENHANCED)**: ALWAYS prioritize the component field over issue description content
-     * Even if issue mentions documentation, IDE setup, or power management
-     * Wi-Fi component → Wi-Fi team (regardless of content type)
-     * tools component → IDF Tools team (not IDE team)
-     * driver component → Chip Support team (even with power-related content)
-     * Only analyze description content when component field is missing or ambiguous
+   - **ABSOLUTE COMPONENT-FIRST RULE**: The component field OVERRIDES ALL description analysis
+     * NEVER let description content override component field
+     * Component field is the ONLY reliable signal - trust it completely
+     * If component field exists, ignore all description content for team assignment
    
-   **Component-to-Team Mapping (UPDATED)**:
-   - BLE/nimble/bluedroid components → BLE team (even if mentions "BT" or "Bluetooth")
-   - Bluetooth Classic/Coexistence components → Classic Bluetooth team
-   - toolchain component → Toolchains & Debuggers (GCC/LLVM)
-   - debugging and tracing component → Toolchains & Debuggers (not USB team)
-   - soc/hal/driver_*/driver components → Chip Support (peripheral drivers)
+   **CRITICAL COMPONENT MAPPINGS (EXACT MATCHES REQUIRED)**:
+   - "Wi-Fi" component → Wi-Fi team (NEVER Other, regardless of documentation content)
+   - "BLE" component → BLE team (NEVER Classic Bluetooth, even if mentions "BT" or "Bluetooth")
+   - "Build System" component → IDF Core (NEVER IDF Tools, ignore tool mentions)
+   - "IDF_Core" component → IDF Core (NEVER Chip Support)
+   - "driver" component → Chip Support (NEVER Sleep and Power Management)
+   - "driver_adc" component → Chip Support (NEVER IDF Core)
+   - "driver_dac" component → Chip Support (NEVER IDF Core)
+   - "storage" component → Storage (NEVER IDF Tools)
+   - "soc" component → Chip Support (NEVER IDF Core)
+   - "newlib" component → IDF Core (NEVER Chip Support)
+   - "tools" component → IDF Tools (NEVER IDE team)
+   
+   **ALL DRIVER COMPONENTS → CHIP SUPPORT (MANDATORY)**:
+   - ANY component starting with "driver_" → Chip Support
+   - "driver", "driver_gpio", "driver_i2c", "driver_spi", "driver_uart" → Chip Support
+   - "driver_adc", "driver_dac", "driver_ledc", "driver_mcpwm" → Chip Support
+   - "soc", "hal", "esp_hw_support" → Chip Support
    - usb_serial_jtag component → Chip Support (serial interface driver, not USB team)
-   - ULP/cxx/freertos/heap/log components → IDF Core (OS & system core)
-   - Build System/IDF_Core components → IDF Core (framework usage)
-   - modbus/LWIP/esp_netif/mdns components → Networking and Protocols
-   - nvs_flash/fatfs/spiffs/vfs components → Storage
-   - mbedtls/esp_tls/provisioning components → Application Utilities
-   - Wi-Fi/PHY/wpa_supplicant components → Wi-Fi team
-   - usb_device/usb_host components → USB team (USB protocol stack)
-   - tools/idf_monitor components → IDF Tools (not IDE team)
    
-   **Build System Disambiguation (CRITICAL)**:
-   Route to **IDF Core** when:
-   - Component is "Build System", "IDF_Core", or "cxx"
-   - Issue is about framework usage patterns, component integration, or language standards
-   - Problems with user component structure, CMakeLists.txt usage, or Kconfig integration
-   - Reproducible builds, linking issues, or build configuration problems
-   - Language standard support (C++, C features)
+   **BLE vs CLASSIC BLUETOOTH (STRICT)**:
+   - "BLE" component → ALWAYS BLE team (NEVER Classic Bluetooth)
+   - "nimble" component → ALWAYS BLE team
+   - "bluedroid" component → ALWAYS BLE team  
+   - Only route to Classic Bluetooth for components: "bt_classic", "a2dp", "spp"
+   - If component contains "BLE" → NEVER Classic Bluetooth
    
-   Route to **IDF Tools** when:
-   - Component is "tools"
-   - Error mentions tools/cmake/*.cmake files or build system internals
-   - VS Code extension, idf.py, or development environment setup issues
-   - CMake engine failures during configure/generate phase
+   **BUILD SYSTEM OVERRIDE RULE (ABSOLUTE)**:
+   - "Build System" component → ALWAYS IDF Core (ignore any tool/cmake mentions)
+   - "IDF_Core" component → ALWAYS IDF Core
+   - "cxx" component → ALWAYS IDF Core (language standards)
+   - Reproducible builds, linking, framework usage → IDF Core
+   - Only route to IDF Tools if component is exactly "tools"
    
-   **Driver vs Power Management**:
-   - If component is "driver" or "driver_*" → Always route to Chip Support
-   - Only route to Sleep and Power Management for components: "sleep and power management", "pm", "esp_pm"
-   - DFS, frequency scaling in driver context → Chip Support (driver behavior)
-   - DFS, frequency scaling in power context → Sleep and Power Management
+   **STORAGE COMPONENTS**:
+   - "storage" component → Storage team (not IDF Tools)
+   - "nvs_flash", "fatfs", "spiffs", "vfs" → Storage
+   - "wear_levelling", "partition_table" → Storage
    
-   **USB vs Serial Disambiguation**:
-   - usb_serial_jtag component → Chip Support (serial interface driver)
-   - usb_device/usb_host components → USB team (USB protocol stack)
-   - debugging and tracing with USB mention → Toolchains & Debuggers (debug tools)
+   **CORE SYSTEM COMPONENTS**:
+   - "newlib" component → IDF Core (C library functions)
+   - "freertos", "heap", "log", "esp_system" → IDF Core
+   - "bootloader", "app_update", "esp_common" → IDF Core
    
-   **Context Rules**:
+   **NETWORKING COMPONENTS**:
+   - "LWIP", "esp_netif", "mdns", "esp_http_client" → Networking and Protocols
+   - "mqtt", "coap", "modbus" → Networking and Protocols
+   
+   **TOOLCHAIN COMPONENTS**:
+   - "toolchain" component → Toolchains & Debuggers
+   - "debugging and tracing" component → Toolchains & Debuggers (not USB team)
+   
+   **FALLBACK RULES (only if component field missing)**:
    - NimBLE stack → BLE (not Classic Bluetooth)
-   - Component resolution errors → focus on component domain, not build error
    - Driver issues → Chip Support (peripheral drivers & HAL)
    - Network protocols → Networking and Protocols
    - Security/crypto → Application Utilities or Security
