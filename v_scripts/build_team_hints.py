@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Build keyword hints for TEAM assignment using:
-1) Load team mapping from GitLab YAML
-2) Prepare 100 examples per team from training data
-3) LLM analysis of all teams at once to extract technical patterns
+Build team-specific keyword hints for team assignment using:
+1) Statistical mining from training data (components -> teams)
+2) LLM expansion for team-specific APIs, errors, and data structures
+3) Highly specific technical signals per team
 """
 
 import os
@@ -35,13 +35,13 @@ REF          = "main"
 REQUEST_TIMEOUT = 30
 
 MODEL            = "gpt-5"
-EXAMPLES_PER_TEAM = 100  # 100 examples per team
-MAX_KEYWORDS     = 50    # max keywords per team from LLM
+BATCH_SIZE       = 3    # teams per LLM batch
+MAX_KEYWORDS     = 40   # max keywords per team from LLM
 
-MIN_TEAM_SAMPLES = 1    # team needs >=10 training issues (1 for testing)
+MIN_TEAM_SAMPLES = 5    # team needs >=5 training issues
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("build-hints")
+log = logging.getLogger("build-team-hints")
 
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 
@@ -92,15 +92,9 @@ def build_team_maps(doc: Dict[str, Any]) -> Tuple[List[str], Dict[str, str]]:
     
     return team_names, comp_to_team
 
-
 # =========================
-# Data loading
+# Text cleaning (minimal - LLM handles the analysis)
 # =========================
-def load_jsonl(path: str) -> List[Dict[str, Any]]:
-    """Load JSONL file"""
-    with open(path, 'r', encoding='utf-8') as f:
-        return [json.loads(line.strip()) for line in f if line.strip()]
-
 def clean_text(text: str) -> str:
     """Basic text cleaning for LLM input"""
     if not text:
@@ -117,10 +111,18 @@ def clean_text(text: str) -> str:
     return text
 
 # =========================
-# Team examples preparation
+# Data loading
 # =========================
-def prepare_team_examples(train_data: List[Dict], comp_to_team: Dict[str, str]) -> Dict[str, List[str]]:
-    """Prepare N examples per team for LLM analysis"""
+def load_jsonl(path: str) -> List[Dict[str, Any]]:
+    """Load JSONL file"""
+    with open(path, 'r', encoding='utf-8') as f:
+        return [json.loads(line.strip()) for line in f if line.strip()]
+
+# =========================
+# Token mining for teams
+# =========================
+def prepare_team_issues(train_data: List[Dict], comp_to_team: Dict[str, str]) -> Dict[str, List[str]]:
+    """Prepare actual issue texts for each team for LLM analysis"""
     
     # Group training data by team (via components)
     team_issues = defaultdict(list)
@@ -143,30 +145,30 @@ def prepare_team_examples(train_data: List[Dict], comp_to_team: Dict[str, str]) 
         for team in item_teams:
             team_issues[team].append(full_text)
     
-    # Filter teams with enough samples and select examples
-    filtered_team_examples = {}
+    # Filter teams with enough samples and limit to reasonable number for LLM
+    filtered_team_issues = {}
     for team, issues in team_issues.items():
         if len(issues) >= MIN_TEAM_SAMPLES:
             # Sort by length (longer issues often have more technical details)
             issues_sorted = sorted(issues, key=len, reverse=True)
-            # Take up to EXAMPLES_PER_TEAM most detailed issues for analysis
-            filtered_team_examples[team] = issues_sorted[:EXAMPLES_PER_TEAM]
+            # Take up to 20 most detailed issues for analysis
+            filtered_team_issues[team] = issues_sorted[:20]
     
-    log.info(f"Prepared examples for {len(filtered_team_examples)} teams")
-    for team, issues in filtered_team_examples.items():
-        log.info(f"  {team}: {len(issues)} examples")
+    log.info(f"Prepared issues for {len(filtered_team_issues)} teams")
+    for team, issues in filtered_team_issues.items():
+        log.info(f"  {team}: {len(issues)} issues")
     
-    return filtered_team_examples
+    return filtered_team_issues
 
 # =========================
-# LLM pattern extraction for all teams at once
+# LLM pattern extraction for teams
 # =========================
-def extract_all_team_patterns_with_llm(client: OpenAI, team_examples: Dict[str, List[str]]) -> Dict[str, List[str]]:
-    """Let LLM analyze all teams at once and extract team-specific technical patterns"""
+def extract_team_patterns_with_llm(client: OpenAI, team_issues: Dict[str, List[str]]) -> Dict[str, List[str]]:
+    """Let LLM analyze actual issues and extract team-specific technical patterns"""
     
-    system_prompt = f"""You are an ESP-IDF expert analyzing bug reports to identify team-specific technical patterns.
+    system_prompt = """You are an ESP-IDF expert analyzing bug reports to identify team-specific technical patterns.
 
-For each team, I'll provide {EXAMPLES_PER_TEAM} actual issue examples from their domain. Analyze these issues and extract:
+For each team, I'll provide actual issue texts from their domain. Analyze these issues and extract:
 
 1. **Specific API function names** mentioned in issues (esp_wifi_connect, gpio_set_level, nvs_get_blob, etc.)
 2. **Specific error codes and messages** (ESP_ERR_WIFI_NOT_INIT, BLE_HS_ENOTCONN, "connection timeout", etc.)
@@ -175,14 +177,14 @@ For each team, I'll provide {EXAMPLES_PER_TEAM} actual issue examples from their
 5. **File paths and component references** (components/esp_wifi, driver/gpio, etc.)
 6. **Technical concepts unique to this team** (provisioning, pairing, wear levelling, etc.)
 
-Extract around {MAX_KEYWORDS} highly specific technical keywords that are ACTUALLY mentioned in the provided issues.
+Extract 25-40 highly specific technical keywords that are ACTUALLY mentioned in the provided issues.
 Do NOT invent keywords - only extract what you see in the issue texts.
 Return lowercase keywords, focus on technical specificity."""
 
     schema = {
         "type": "json_schema",
         "json_schema": {
-            "name": "extract_all_team_patterns",
+            "name": "extract_team_patterns",
             "schema": {
                 "type": "object",
                 "properties": {
@@ -228,52 +230,56 @@ Return lowercase keywords, focus on technical specificity."""
         }
     }
     
-    # Build prompt with all teams and their examples
-    prompt_parts = ["Analyze these ESP-IDF team issues and extract technical patterns:\n"]
+    extracted_patterns = {}
+    teams = list(team_issues.keys())
     
-    for team, examples in team_examples.items():
-        prompt_parts.append(f"\n=== {team} Team Issues ===")
-        # Use first 20 examples for analysis (to keep prompt manageable)
-        for j, issue_text in enumerate(examples[:20], 1):
-            # Truncate very long issues
-            truncated = issue_text[:600] + "..." if len(issue_text) > 600 else issue_text
-            prompt_parts.append(f"Issue {j}: {truncated}")
-    
-    prompt = "\n".join(prompt_parts)
-    
-    try:
-        log.info(f"Processing all {len(team_examples)} teams in single LLM call...")
-        response = client.chat.completions.create(
-            model=MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt}
-            ],
-            response_format=schema,
-        )
+    # Process in batches
+    for i in range(0, len(teams), BATCH_SIZE):
+        batch_teams = teams[i:i+BATCH_SIZE]
         
-        data = json.loads(response.choices[0].message.content)
-        extracted_patterns = {}
+        # Build prompt with actual issue texts
+        prompt_parts = ["Analyze these ESP-IDF team issues and extract technical patterns:\n"]
+        for team in batch_teams:
+            issues = team_issues[team][:10]  # Use up to 10 representative issues
+            prompt_parts.append(f"\n=== {team} Team Issues ===")
+            for j, issue_text in enumerate(issues, 1):
+                # Truncate very long issues
+                truncated = issue_text[:800] + "..." if len(issue_text) > 800 else issue_text
+                prompt_parts.append(f"Issue {j}: {truncated}")
         
-        for item in data.get("teams", []):
-            team = item["team"]
-            patterns = item.get("patterns", {})
+        prompt = "\n".join(prompt_parts)
+        
+        try:
+            response = client.chat.completions.create(
+                model=MODEL,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt}
+                ],
+                response_format=schema,
+                temperature=0
+            )
             
-            # Flatten all patterns into a single keyword list
-            all_keywords = []
-            for category in ["api_functions", "error_codes", "data_structures", "technical_terms"]:
-                keywords = [kw.strip().lower() for kw in patterns.get(category, []) if kw.strip()]
-                all_keywords.extend(keywords)
+            data = json.loads(response.choices[0].message.content)
+            for item in data.get("teams", []):
+                team = item["team"]
+                patterns = item.get("patterns", {})
+                
+                # Flatten all patterns into a single keyword list
+                all_keywords = []
+                for category in ["api_functions", "error_codes", "data_structures", "technical_terms"]:
+                    keywords = [kw.strip().lower() for kw in patterns.get(category, []) if kw.strip()]
+                    all_keywords.extend(keywords)
+                
+                extracted_patterns[team] = all_keywords
+                log.info(f"Extracted {len(all_keywords)} patterns for {team}")
+                
+            log.info(f"Processed batch {i//BATCH_SIZE + 1}/{(len(teams)-1)//BATCH_SIZE + 1}")
             
-            extracted_patterns[team] = all_keywords
-            log.info(f"Extracted {len(all_keywords)} patterns for {team}")
-        
-        log.info("Successfully processed all teams in single call")
-        return extracted_patterns
-        
-    except Exception as e:
-        log.error(f"LLM pattern extraction failed: {e}")
-        return {}
+        except Exception as e:
+            log.warning(f"Pattern extraction failed for batch {i//BATCH_SIZE + 1}: {e}")
+    
+    return extracted_patterns
 
 # =========================
 # Build final team hints
@@ -321,13 +327,13 @@ def main():
     train_data = load_jsonl(TRAIN_PATH)
     log.info(f"Loaded: {len(train_data)} training items")
     
-    # Prepare examples for each team
-    team_examples = prepare_team_examples(train_data, comp_to_team)
-    log.info(f"Prepared examples for {len(team_examples)} teams")
+    # Prepare actual issue texts for LLM analysis
+    team_issues = prepare_team_issues(train_data, comp_to_team)
+    log.info(f"Prepared issues for {len(team_issues)} teams")
     
-    # Extract patterns with LLM (all teams at once)
+    # Extract patterns with LLM
     client = OpenAI(api_key=OPENAI_API_KEY)
-    extracted_patterns = extract_all_team_patterns_with_llm(client, team_examples)
+    extracted_patterns = extract_team_patterns_with_llm(client, team_issues)
     log.info(f"LLM extracted patterns for {len(extracted_patterns)} teams")
     
     # Build final hints

@@ -11,12 +11,12 @@ from openai import OpenAI
 # =========================
 # CONFIG
 # =========================
-TEST_PATH = "v_data/train_done_issues.jsonl"
+TEST_PATH = "v_data/test_done_issues.jsonl"
 COMPONENTS_PATH = "v_data/components.json"
 OUT_PREDS_PATH = "predictions.json"
 
-MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-TEST_LIMIT = 50
+MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
+TEST_LIMIT = 200
 SHOW_DIAGNOSTICS = True
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -175,7 +175,8 @@ COMPONENT PREFERENCE RULES:
 - FAT filesystem (ff.c, f_mount) → prefer "storage" over "toolchain"
 - Generic hardware issues (DMA, PSRAM, memory) → prefer "driver" over specific components
 - Cross-component hardware issues → prefer "driver" over specific drivers
-- Multi-channel RMT driver issues → prefer "driver" over "driver_rmt" 
+- Multi-channel RMT driver issues → prefer "driver" over "driver_rmt"
+- RMT frequency/timing issues → prefer "driver_rmt" over "driver" 
 - BLE advertising/GATT issues → prefer "BLE" over "bluedroid"
 - BLE linking errors (esp_vhci_host_*) → prefer "BLE" over "toolchain"
 - BLE mesh coexistence → prefer "BLE_Mesh" over "Coexistence"
@@ -183,6 +184,9 @@ COMPONENT PREFERENCE RULES:
 - SDSPI specific issues → prefer "driver_sdspi" over "sdmmc"
 - Monitor/IDF tools → prefer "tools" over "windows platform"
 - PowerShell installation scripts → prefer "tools" over "windows platform"
+- IDF tools installation/setup → prefer "tools" over "Build System"
+- idf.py menuconfig/build errors → prefer "tools" over "Build System"
+- System dependencies (libusb) → prefer "tools" over "Documentation"
 - ROM functions (components/esp_rom/) → prefer "esp_rom" over "driver_gpio"
 - ODR violations/C++ issues → prefer "cxx" over "mbedtls"
 - USB device stack → prefer "usb_device" over "usb"
@@ -191,6 +195,44 @@ COMPONENT PREFERENCE RULES:
 - Modbus timer configuration → prefer "modbus" over "driver"
 - RTC GPIO sleep → prefer "sleep and power management" over "driver"
 - Clang-tidy tools → prefer "clang-tidy-runner" over "toolchain"
+- RTC memory bootloader APIs → prefer "IDF_Core" over "driver" or "bootloader"
+- Unit testing/coverage → prefer "IDF_Core" over "unit_test" when cross-cutting
+- panic_abort functions → prefer "IDF_Core" over "panic"
+- Monitor UART/serial issues → prefer "idf_monitor" over "tools"
+- HID Bluetooth APIs → prefer "Bluetooth Classic" over "BLE"
+- L2CAP Bluetooth → prefer "Bluetooth Classic" over "BLE"
+- NVS in bootloader → prefer "nvs_flash" over "bootloader"
+- esp_tls errors → prefer "esp_tls" over "esp_http_client"
+- RMT specific driver issues → prefer "driver_rmt" over "driver"
+- WiFi mesh (not BLE mesh) → prefer "Wi-Fi" over "BLE_Mesh"
+- SD card filesystem → prefer "storage" over "sdmmc"
+- BLE Mesh build errors → prefer "BLE" over "BLE_Mesh"
+- Connection transport layer → prefer "tcp_transport" over "Wi-Fi"
+- PPP protocol examples → prefer "PPP" over "esp-lwip"
+- OpenThread CLI builds → prefer "Thread" over "802.15.4"
+- WPA3 authentication → prefer "wpa_supplicant" over "Wi-Fi"
+- MicroSD card filesystem → prefer "storage" over "sdmmc"
+- Flashing/esptool issues → prefer "esptool_py" over "driver"
+- Network interface builds → prefer "esp_netif" over "windows platform"
+- Ethernet MAC drivers → prefer "ethernet" over "driver"
+- Bootloader custom features → prefer "bootloader" over "IDF_Core"
+- LCD display drivers → prefer "esp_lcd" over "driver_cam"
+- PPP protocol examples → prefer "esp-protocols" over "PPP"
+- WebSocket connections → prefer "esp-protocols" over "esp_http_client"
+- Build environment variables → prefer "tools" over "Build System"
+- Flashing/connecting issues → prefer "esptool_py" over "esp_http_client"
+- Network interface examples → prefer "esp_netif" over "windows platform"
+- Component name consistency → prefer exact component names over variations:
+  * LWIP issues → prefer "LWIP" over "esp-lwip"
+  * MQTT client issues → prefer "MQTT" over "esp-mqtt" 
+  * HTTP server functions → prefer "HTTP Server" over "esp_http_client"
+  * USB host functionality → prefer "usb_host" over "usb"
+  * NimBLE stack issues → prefer "nimble" over "BLE"
+  * BLE high-rate data → prefer "BLE" over "BLE_Mesh"
+  * HID device examples → prefer "BLE" over "Bluetooth Classic"
+  * System tracing → prefer "app_trace" over "tools"
+  * SBOM functionality → prefer "sbom_tool" over "tools"
+  * OTA updates → prefer "app_update" over "esp_https_ota"
 
 MULTI-STEP ANALYSIS FRAMEWORK:
 Step 1: IDENTIFY technical signals
@@ -252,6 +294,48 @@ CLASSIFICATION EXAMPLES:
 - CONFIG_FMB_TIMER_USE_ISR_DISPATCH_METHOD → modbus (not driver)
 - RTC GPIO deep sleep wakeup → sleep and power management (not driver)
 - idf_clang_tidy runner → clang-tidy-runner (not toolchain)
+- install.ps1 PowerShell, IDF_PYTHON_ENV_PATH → tools (not Build System)
+- idf.py menuconfig Access violation → tools (not Build System)
+- install.sh ESP-IDF tools download → tools (not Build System)
+- libusb-1.0.so.0 missing dependency → tools (not Documentation)
+- bootloader_common_get_rtc_retain_mem RTC memory → IDF_Core (not driver)
+- Linux Host Unit Testing Coverage → IDF_Core (not unit_test)
+- panic_abort(const char *details) → IDF_Core (not panic)
+- SerialMonitor.serial_write() UART hangs → idf_monitor (not tools)
+- RFC2217 based connection exception → idf_monitor (not tools)
+- esp_bt_hidh_init() HID Bluetooth → Bluetooth Classic (not BLE)
+- bt_l2cap_client L2CAP connection → Bluetooth Classic (not BLE)
+- NVS support in bootloader → nvs_flash (not bootloader)
+- esp_tls_error_handle_t conversion → esp_tls (not esp_http_client)
+- RMT repeats first item frequencies → driver_rmt (not driver)
+- Wifi mesh rssi neighbors parent → Wi-Fi (not BLE_Mesh)
+- MicroSD card filesystem mount → storage (not sdmmc)
+- CONFIG_BLE_MESH_PB_ADV build error → BLE (not BLE_Mesh)
+- example_connect() repeatedly disconnecting → tcp_transport (not Wi-Fi)
+- pppos example missing → PPP (not esp-lwip)
+- OpenThread CLI example build fails → Thread (not 802.15.4)
+- WPA3 connect endless loop → wpa_supplicant (not Wi-Fi)
+- MicroSD card filesystem work → storage (not sdmmc)
+- ESP32 hangs on Connecting flashing → esptool_py (not driver)
+- softap_sta build fail win10 → esp_netif (not windows platform)
+- w5500-mac no mem receive buffer → ethernet (not driver)
+- BOOTLOADER_CUSTOM_RESERVE_RTC missing → bootloader (not IDF_Core)
+- LCD Camera DMA interrupt → esp_lcd (not driver_cam)
+- AP_to_pppos example → esp-protocols (not PPP)
+- WebSocket connection 火山大模型 → esp-protocols (not esp_http_client)
+- IDF_PYTHON_ENV_PATH build → tools (not Build System)
+- ESP32 hangs Connecting flashing → esptool_py (not esp_http_client)
+- softap_sta example build win10 → esp_netif (not windows platform)
+- CONFIG_LWIP_CHECK_THREAD_SAFETY → LWIP (not esp-lwip)
+- MQTT client Non-ssl scheme → MQTT (not esp-mqtt)
+- httpd_req_recv function → HTTP Server (not esp_http_client)
+- usb_host.h header file → usb_host (not usb)
+- NimBLE examples panic iPhone → nimble (not BLE)
+- BLE Mesh high data rate buffers → BLE (not BLE_Mesh)
+- esp_hid_device bluetooth example → BLE (not Bluetooth Classic)
+- sysview_tracing_heap_log → app_trace (not tools)
+- SBOM vulnerability database → sbom_tool (not tools)
+- OTA crash esp_https_ota → app_update (not esp_https_ota)
 - RMT multi-channel 多通道输出支持 → driver (not driver_rmt)
 
 Follow this systematic approach for accurate classification. Choose only from provided components (case-sensitive).
