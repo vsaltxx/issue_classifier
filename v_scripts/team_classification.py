@@ -18,15 +18,13 @@ from openai import OpenAI
 
 load_dotenv()
 # =========================
-# CONFIG (edit as needed)
+# CONFIG
 # =========================
-# GitLab private instance (you already used it)
 GITLAB_URL   = os.environ["GITLAB_URL"]
 GITLAB_TOKEN = os.environ["GITLAB_TOKEN"]
 PROJECT_PATH = "idf/idf-components-mapping"
 FILE_PATH    = "components.yaml"
 REF          = "main"
-REQUEST_TIMEOUT = 30
 
 # Data
 TEST_PATH        = "v_data/test_done_issues.jsonl"  # issues with components field (true components)
@@ -35,8 +33,9 @@ OUT_PREDS_PATH   = "predictions_teams.json"
 
 # Model
 MODEL            = os.getenv("OPENAI_MODEL", "gpt-5")
-TEST_LIMIT       = 200
+TEST_LIMIT       = 100
 SHOW_DIAGNOSTICS = True
+BATCH_SIZE       = 20  # Process N issues at once
 
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 
@@ -96,7 +95,7 @@ def fetch_components_yaml() -> Dict[str, Any]:
     url = gitlab_file_raw_url(GITLAB_URL, PROJECT_PATH, FILE_PATH, REF)
     headers = {"PRIVATE-TOKEN": GITLAB_TOKEN}
     log.info("GET %s", url)
-    r = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+    r = requests.get(url, headers=headers)
     r.raise_for_status()
     return yaml.safe_load(r.text) or {}
 
@@ -191,6 +190,16 @@ def build_team_keywords(
 # =========================
 # Gold: components -> team
 # =========================
+def gold_teams_for_issue(components: List[str], comp_to_team: Dict[str, str]) -> List[str]:
+    """
+    Find all possible gold teams for an issue based on its components.
+    Returns list of teams that have components in this issue.
+    """
+    if not components:
+        return []
+    teams = [comp_to_team.get(c) for c in components if comp_to_team.get(c)]
+    return list(set(teams))  # Remove duplicates
+
 def gold_team_for_issue(components: List[str], comp_to_team: Dict[str, str]) -> str | None:
     """
     Map issue component list to one team:
@@ -230,23 +239,53 @@ Analysis Framework:
    - When component field conflicts with description, trust the component
 
 3. APPLY classification rules:
-   - **COMPONENT-FIRST RULE**: Always prioritize the component field over error descriptions
+   - **COMPONENT-FIRST RULE (ENHANCED)**: ALWAYS prioritize the component field over issue description content
+     * Even if issue mentions documentation, IDE setup, or power management
+     * Wi-Fi component → Wi-Fi team (regardless of content type)
+     * tools component → IDF Tools team (not IDE team)
+     * driver component → Chip Support team (even with power-related content)
+     * Only analyze description content when component field is missing or ambiguous
    
-   **Component-to-Team Mapping**:
+   **Component-to-Team Mapping (UPDATED)**:
    - BLE/nimble/bluedroid components → BLE team (even if mentions "BT" or "Bluetooth")
    - Bluetooth Classic/Coexistence components → Classic Bluetooth team
-   - Build System component (internal) → IDF Core (FreeRTOS, system core)
-   - Build System tools (cmake, idf.py) → IDF Tools (developer tooling)
    - toolchain component → Toolchains & Debuggers (GCC/LLVM)
-   - debugging and tracing component → Toolchains & Debuggers
-   - soc/hal/driver_* components → Chip Support (peripheral drivers)
+   - debugging and tracing component → Toolchains & Debuggers (not USB team)
+   - soc/hal/driver_*/driver components → Chip Support (peripheral drivers)
+   - usb_serial_jtag component → Chip Support (serial interface driver, not USB team)
    - ULP/cxx/freertos/heap/log components → IDF Core (OS & system core)
+   - Build System/IDF_Core components → IDF Core (framework usage)
    - modbus/LWIP/esp_netif/mdns components → Networking and Protocols
    - nvs_flash/fatfs/spiffs/vfs components → Storage
    - mbedtls/esp_tls/provisioning components → Application Utilities
    - Wi-Fi/PHY/wpa_supplicant components → Wi-Fi team
-   - usb_device/usb_host components → USB team
-   - tools/idf_monitor components → IDF Tools
+   - usb_device/usb_host components → USB team (USB protocol stack)
+   - tools/idf_monitor components → IDF Tools (not IDE team)
+   
+   **Build System Disambiguation (CRITICAL)**:
+   Route to **IDF Core** when:
+   - Component is "Build System", "IDF_Core", or "cxx"
+   - Issue is about framework usage patterns, component integration, or language standards
+   - Problems with user component structure, CMakeLists.txt usage, or Kconfig integration
+   - Reproducible builds, linking issues, or build configuration problems
+   - Language standard support (C++, C features)
+   
+   Route to **IDF Tools** when:
+   - Component is "tools"
+   - Error mentions tools/cmake/*.cmake files or build system internals
+   - VS Code extension, idf.py, or development environment setup issues
+   - CMake engine failures during configure/generate phase
+   
+   **Driver vs Power Management**:
+   - If component is "driver" or "driver_*" → Always route to Chip Support
+   - Only route to Sleep and Power Management for components: "sleep and power management", "pm", "esp_pm"
+   - DFS, frequency scaling in driver context → Chip Support (driver behavior)
+   - DFS, frequency scaling in power context → Sleep and Power Management
+   
+   **USB vs Serial Disambiguation**:
+   - usb_serial_jtag component → Chip Support (serial interface driver)
+   - usb_device/usb_host components → USB team (USB protocol stack)
+   - debugging and tracing with USB mention → Toolchains & Debuggers (debug tools)
    
    **Context Rules**:
    - NimBLE stack → BLE (not Classic Bluetooth)
@@ -258,7 +297,7 @@ Analysis Framework:
 Only choose from the provided team names (case-sensitive).
 Provide clear technical reasoning for your choice."""
 
-def team_schema(team_names: List[str]) -> Dict[str, Any]:
+def team_schema(team_names: List[str], batch_size: int = 1) -> Dict[str, Any]:
     """Schema for /v1/responses endpoint"""
     return {
         "type": "json_schema",
@@ -268,7 +307,7 @@ def team_schema(team_names: List[str]) -> Dict[str, Any]:
             "properties": {
                 "predictions": {
                     "type": "array",
-                    "minItems": 1, "maxItems": 1,
+                    "minItems": 1, "maxItems": batch_size,
                     "items": {
                         "type": "object",
                         "properties": {
@@ -287,87 +326,64 @@ def team_schema(team_names: List[str]) -> Dict[str, Any]:
         "strict": True
     }
 
-def make_prompt_for_issue(
+
+def make_prompt(
     team_keywords: Dict[str, List[str]],
     team_to_components: Dict[str, List[str]],
-    issue: IssueRow
+    issues: List[IssueRow]
 ) -> str:
-    """
-    Enhanced prompt with detailed team descriptions and classification examples.
-    """
-    lines = []
-    lines.append("Analyze this ESP-IDF issue and assign the responsible team using the technical analysis framework.\n")
+    """Simple prompt with component mappings."""
     
-    lines.append("AVAILABLE TEAMS:\n")
+    # Build team-component mapping
+    team_components_text = ""
+    for team, components in team_to_components.items():
+        components_list = ", ".join(components)
+        team_components_text += f"• {team}: {components_list}\n"
     
-    # Enhanced team descriptions with clear domains
-    team_descriptions = {
-        "Chip Support": "Peripheral drivers & HAL (ADC/DAC/GPIO/I2C/SPI/UART/Timers), chip bring-up, hardware support (CACHE/MMU/PSRAM/FLASH), camera/LCD/sensors. Components: driver_*, soc, hal, esp_lcd, spi_flash",
-        "Wi-Fi": "WiFi connectivity, esp_wifi_* APIs, PHY layer, WPA supplicant. Components: Wi-Fi, PHY, wpa_supplicant",
-        "BLE": "Bluetooth Low Energy stack, GATT, GAP, NimBLE, Bluedroid BLE parts. Components: BLE, BLE_Mesh, nimble, bluedroid - ANY BLE component",
-        "Classic Bluetooth": "Classic Bluetooth protocols, SPP, A2DP, HID, L2CAP, coexistence. Components: Bluetooth Classic, Coexistence - ONLY when NOT BLE",
-        "Networking and Protocols": "lwIP TCP/IP stack, ethernet, protocol libraries (MQTT, mDNS, WebSocket), Modbus. Components: LWIP, esp_netif, ethernet, MQTT, mdns, modbus",
-        "Application Utilities": "HTTP server/client, TLS/SSL, OTA updates, provisioning, JSON, crypto. Components: esp_http_*, esp_tls, mbedtls, app_update, provisioning",
-        "Storage": "NVS flash, filesystems (FAT/SPIFFS), wear levelling, partitions, SD cards. Components: nvs_flash, fatfs, spiffs, vfs, sdmmc, storage",
-        "IDF Core": "OS & system core: FreeRTOS, heap, logging, bootloader, ULP, C++ support, system features. Components: freertos, heap, log, bootloader, ULP, cxx, Build System (internal)",
-        "IDF Tools": "Developer tooling: idf.py, installers, monitor, build tools, size analysis. Components: tools, idf_monitor, Build System (cmake tools)",
-        "Toolchains & Debuggers": "GCC/LLVM toolchains, OpenOCD, debugging, coredump, tracing. Components: toolchain, debugging and tracing, app_trace, gdbstub, coredump",
-        "USB": "USB Host/Device stacks, TinyUSB, USB OTG drivers. Components: usb_device, usb_host, usb",
-        "802.15.4": "IEEE 802.15.4, Thread, Zigbee, Matter protocols. Components: 802.15.4, Thread, Zigbee, Matter",
-        "Sleep and Power Management": "Deep sleep, light sleep, power management, wake sources. Components: sleep and power management",
-        "Security": "Secure boot, flash encryption, cryptographic functions. Components: security, libsodium, esp_tee",
-        "IDE": "IDE plugins for VS Code, Eclipse, development environment. Components: IDE",
-        "Other": "Testing, CI, documentation, hardware issues, 3rd party libraries. Components: test-environments, unit_test, CI, Documentation"
-    }
+    # Build issues text
+    if len(issues) == 1:
+        issue_header = "Analyze this ESP-IDF issue and assign the responsible team."
+        issues_text = json.dumps({
+            "issue_key": issues[0].issue_key,
+            "summary": issues[0].summary,
+            "description": issues[0].description
+        }, ensure_ascii=False, indent=2)
+    else:
+        issue_header = f"Analyze these {len(issues)} ESP-IDF issues and assign the responsible team for each."
+        issues_list = []
+        for i, issue in enumerate(issues, 1):
+            issue_obj = {
+                "issue_key": issue.issue_key,
+                "summary": issue.summary,
+                "description": issue.description
+            }
+            issues_list.append(f"Issue {i}:\n{json.dumps(issue_obj, ensure_ascii=False, indent=2)}")
+        issues_text = "\n\n".join(issues_list)
     
-    for team, comps in team_to_components.items():
-        description = team_descriptions.get(team, "")
-        kws = ", ".join(team_keywords.get(team, [])[:15])  # Show more keywords
-        sample_comps = ", ".join(comps[:8])  # Show more components
-        
-        lines.append(f"• {team}:")
-        lines.append(f"  Domain: {description}")
-        if kws:
-            lines.append(f"  Keywords: {kws}")
-        if sample_comps:
-            lines.append(f"  Components: {sample_comps}")
-        lines.append("")
-    
-    lines.append("CLASSIFICATION EXAMPLES:")
-    lines.append("• 'gpio_set_level not working' → Chip Support (GPIO driver)")
-    lines.append("• 'esp_wifi_connect returns ESP_ERR_WIFI_NOT_INIT' → Wi-Fi (WiFi API)")
-    lines.append("• 'BLE_HS_ENOTCONN after pairing' → BLE (BLE error code)")
-    lines.append("• 'ESP BLE GATT Server' + BLE component → BLE (component field is decisive)")
-    lines.append("• 'BT GATT indicate' + BLE component → BLE (BLE component overrides BT mention)")
-    lines.append("• 'NimBLE SPP server example' → BLE (NimBLE is BLE stack, not Classic Bluetooth)")
-    lines.append("• 'Bluedroid SPP connection' → Classic Bluetooth (Bluedroid handles Classic BT)")
-    lines.append("• 'nvs_flash_init fails' → Storage (NVS functionality)")
-    lines.append("• 'HTTP client timeout' → Networking and Protocols (HTTP protocol)")
-    lines.append("• 'Failed to resolve component mdns' → Networking and Protocols (focus on mdns component, not build error)")
-    lines.append("• 'Build System component' → IDF Core (Build System is core functionality)")
-    lines.append("• 'toolchain component' → Toolchains & Debuggers (not IDF Tools)")
-    lines.append("• 'ULP component' → IDF Core (Ultra Low Power is core feature)")
-    lines.append("• 'soc component' → Chip Support (System on Chip support)")
-    lines.append("• 'idf.py build fails on Windows' → IDF Tools (build system)")
-    lines.append("• 'malloc returns NULL' → IDF Core (heap management)")
-    lines.append("• 'deep sleep current consumption' → Sleep and Power Management (power)")
-    lines.append("")
-    
-    lines.append("ISSUE TO CLASSIFY:")
-    issue_obj = {
-        "issue_key": issue.issue_key,
-        "summary": issue.summary,
-        "description": issue.description
-    }
-    lines.append(json.dumps(issue_obj, ensure_ascii=False, indent=2))
-    
-    lines.append("\nAnalyze the technical signals and assign the most appropriate team.")
-    return "\n".join(lines)
+    return f"""
+{issue_header}
+
+TEAM COMPONENT MAPPINGS:
+{team_components_text}
+
+CLASSIFICATION RULES:
+• Use component field as primary signal (most reliable)
+• If no component, analyze technical content for APIs, error codes, or domains
+• Build system: Framework usage → IDF Core, Tool internals → IDF Tools
+
+ISSUES:
+{issues_text}
+""".strip()
+
 
 # =========================
 # Evaluation
 # =========================
-def evaluate_accuracy(gold_by_key: Dict[str, str], pred_by_key: Dict[str, str]) -> Tuple[Dict[str, Any], List[Dict[str, str]]]:
+def evaluate_accuracy(gold_by_key: Dict[str, str], pred_by_key: Dict[str, str], gold_teams_by_key: Dict[str, List[str]] = None) -> Tuple[Dict[str, Any], List[Dict[str, str]]]:
+    """
+    Evaluate accuracy with multi-component support.
+    If gold_teams_by_key is provided, count as correct if predicted team is in any of the gold teams.
+    """
     total = correct = 0
     mismatches = []
     
@@ -376,13 +392,28 @@ def evaluate_accuracy(gold_by_key: Dict[str, str], pred_by_key: Dict[str, str]) 
         if not pred:
             continue
         total += 1
+        
+        # Check if prediction is correct
+        is_correct = False
         if pred == gold:
+            is_correct = True
+        elif gold_teams_by_key and k in gold_teams_by_key:
+            # Multi-component case: check if predicted team is in any of the valid teams
+            valid_teams = gold_teams_by_key[k]
+            if pred in valid_teams:
+                is_correct = True
+        
+        if is_correct:
             correct += 1
         else:
+            expected_display = gold
+            if gold_teams_by_key and k in gold_teams_by_key and len(gold_teams_by_key[k]) > 1:
+                expected_display = f"{gold} (or {', '.join(gold_teams_by_key[k])})"
+            
             mismatches.append({
                 "issue_key": k,
                 "predicted": pred,
-                "expected": gold
+                "expected": expected_display
             })
     
     acc = (correct / total) if total else 0.0
@@ -412,16 +443,25 @@ def main():
 
     # 4) Gold teams by mapping components -> team
     gold_by_key: Dict[str, str] = {}
+    gold_teams_by_key: Dict[str, List[str]] = {}
     for it in issues:
         team = gold_team_for_issue(it.components, comp_to_team)
+        teams = gold_teams_for_issue(it.components, comp_to_team)
         if team:
             gold_by_key[it.issue_key] = team
+            gold_teams_by_key[it.issue_key] = teams
     log.info("Gold teams available for %d issues (others skipped in eval)", len(gold_by_key))
 
-    # 5) Predict per issue
+    # 5) Predict per issue (with batching for efficiency)
     preds: List[Dict[str, str]] = []
-    for i, it in enumerate(issues, 1):
-        prompt = make_prompt_for_issue(team_keywords, team_to_components, it)
+    
+    for batch_start in range(0, len(issues), BATCH_SIZE):
+        batch_end = min(batch_start + BATCH_SIZE, len(issues))
+        batch_issues = issues[batch_start:batch_end]
+        
+        log.info("Processing batch %d-%d/%d", batch_start + 1, batch_end, len(issues))
+        
+        prompt = make_prompt(team_keywords, team_to_components, batch_issues)
         resp = client.responses.create(
             model=MODEL,
             input=[
@@ -429,14 +469,16 @@ def main():
                 {"role": "user", "content": prompt},
             ],
             text={
-                "format": team_schema(team_names)
+                "format": team_schema(team_names, len(batch_issues))
             },
         )
         # Parse response from /v1/responses format
         obj = json.loads(resp.output_text)
-        pred = obj["predictions"][0]
-        preds.append({"issue_key": pred["issue_key"], "team": pred["team"]})
-        log.info("Pred %d/%d: %s -> %s", i, len(issues), it.issue_key, pred["team"])
+        batch_preds = obj["predictions"]
+        
+        for pred in batch_preds:
+            preds.append({"issue_key": pred["issue_key"], "team": pred["team"]})
+            log.info("Pred: %s -> %s", pred["issue_key"], pred["team"])
 
     # 6) Save & evaluate
     with open(OUT_PREDS_PATH, "w", encoding="utf-8") as f:
@@ -444,7 +486,7 @@ def main():
     log.info("Saved predictions → %s (%d)", OUT_PREDS_PATH, len(preds))
 
     pred_by_key = {p["issue_key"]: p["team"] for p in preds}
-    metrics, mismatches = evaluate_accuracy(gold_by_key, pred_by_key)
+    metrics, mismatches = evaluate_accuracy(gold_by_key, pred_by_key, gold_teams_by_key)
     log.info("Evaluation: %s", metrics)
     print(json.dumps(metrics, ensure_ascii=False, indent=2))
     
