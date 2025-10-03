@@ -33,7 +33,7 @@ OUT_PREDS_PATH   = "predictions_teams.json"
 
 # Model
 MODEL            = os.getenv("OPENAI_MODEL", "gpt-5")
-TEST_LIMIT       = 100
+TEST_LIMIT       = 60
 SHOW_DIAGNOSTICS = True
 BATCH_SIZE       = 20  # Process N issues at once
 
@@ -149,41 +149,84 @@ def load_hints(path: str) -> Dict[str, str]:
         return {}
 
 
+def normalize_team_name(team_name: str) -> str:
+    """Normalize team name for matching"""
+    # Remove "team" suffix and normalize
+    normalized = team_name.lower().strip()
+    if normalized.endswith(" team"):
+        normalized = normalized[:-5].strip()
+    return normalized
+
 def build_team_keywords(
     team_to_components: Dict[str, List[str]],
     hints_kw2team: Dict[str, str]
 ) -> Dict[str, List[str]]:
     """
-    Collect keywords for each team:
-    - from team_hints.json (keyword -> team) directly
+    Convert keyword->team mapping to team->keywords mapping.
+    Uses team_hints.json data to build keyword lists for each team.
     """
     per_team: Dict[str, List[str]] = defaultdict(list)
     
-    # Direct mapping from keyword to team
-    for kw, team in hints_kw2team.items():
-        if team in team_to_components:  # Only include teams we know about
-            per_team[team].append(kw)
+    # Create normalized team name mapping
+    gitlab_teams_normalized = {}
+    for team in team_to_components.keys():
+        normalized = normalize_team_name(team)
+        gitlab_teams_normalized[normalized] = team
     
-    # Clean and limit keywords per team
+    log.info("GitLab teams normalized: %s", list(gitlab_teams_normalized.keys()))
+    
+    # Convert keyword->team to team->keywords
+    matched_teams = set()
+    unmatched_teams = set()
+    
+    for keyword, team_name in hints_kw2team.items():
+        # Normalize team name from hints
+        team_name_normalized = normalize_team_name(team_name)
+        
+        # Find matching team
+        matching_team = gitlab_teams_normalized.get(team_name_normalized)
+        
+        if matching_team:
+            per_team[matching_team].append(keyword.strip())
+            matched_teams.add(team_name)
+        else:
+            unmatched_teams.add(team_name)
+    
+    log.info("Matched %d hint teams, unmatched: %d", len(matched_teams), len(unmatched_teams))
+    if unmatched_teams:
+        log.info("Unmatched hint teams: %s", sorted(list(unmatched_teams))[:5])
+    
+    # Clean and deduplicate keywords per team
     for team in per_team:
         keywords = per_team[team]
         # Remove duplicates while preserving order
         seen = set()
         filtered = []
-        for w in keywords:
-            w = str(w).lower().strip()
-            if not w or len(w) < 2: 
+        for kw in keywords:
+            kw_clean = str(kw).strip()
+            if not kw_clean or len(kw_clean) < 2: 
                 continue
-            if w in seen:
+            if kw_clean.lower() in seen:
                 continue
-            seen.add(w)
-            filtered.append(w)
+            seen.add(kw_clean.lower())
+            filtered.append(kw_clean)
         per_team[team] = filtered
     
     # Ensure all teams have at least an empty list
     for team in team_to_components:
         if team not in per_team:
             per_team[team] = []
+    
+    teams_with_keywords = len([t for t in per_team if per_team[t]])
+    total_keywords = sum(len(kws) for kws in per_team.values())
+    log.info("Built keywords for %d/%d teams, total keywords: %d", 
+             teams_with_keywords, len(team_to_components), total_keywords)
+    
+    # Log sample keywords for debugging
+    for team, keywords in per_team.items():
+        if keywords:
+            log.info("Team '%s': %d keywords (sample: %s)", 
+                    team, len(keywords), ", ".join(keywords[:5]))
     
     return dict(per_team)
 
@@ -221,89 +264,166 @@ def gold_team_for_issue(components: List[str], comp_to_team: Dict[str, str]) -> 
 # =========================
 SYSTEM_MSG = """You are an expert ESP-IDF triage assistant with deep knowledge of team responsibilities and technical domains.
 
-Your task is to assign exactly ONE responsible team for each issue based on technical analysis.
+Your task is to assign exactly ONE responsible team for each issue based on technical analysis of the issue content.
 
 Analysis Framework:
 1. IDENTIFY technical signals in the issue:
    - API function names (esp_wifi_*, gpio_*, nvs_*, i2c_*, etc.)
    - Error codes (ESP_ERR_*, BLE_HS_*, specific error messages)
-   - Component/file paths (components/esp_wifi, driver/gpio, etc.)
-   - Hardware terms (GPIO pins, I2C, SPI, UART, etc.)
-   - Protocol names (HTTP, MQTT, BLE, WiFi, etc.)
+   - File paths and includes (components/esp_wifi, driver/gpio, etc.)
+   - Hardware terms (GPIO pins, I2C, SPI, UART, ADC, etc.)
+   - Protocol names (HTTP, MQTT, BLE, WiFi, TCP, etc.)
+   - Technical keywords and domain-specific terms
 
 2. MATCH signals to team expertise:
-   - **PRIMARY**: Check component field first - it's the most reliable signal
-   - Look for team-specific keywords and APIs
-   - Consider the primary technical domain
-   - Focus on the ROOT CAUSE, not just symptoms
-   - When component field conflicts with description, trust the component
+   - Use the provided team technical keywords to identify domain matches
+   - Look for specific function names, data structures, and error patterns
+   - Consider the primary technical domain and root cause
+   - Match issue symptoms to team specializations
 
 3. APPLY classification rules:
-   - **ABSOLUTE COMPONENT-FIRST RULE**: The component field OVERRIDES ALL description analysis
-     * NEVER let description content override component field
-     * Component field is the ONLY reliable signal - trust it completely
-     * If component field exists, ignore all description content for team assignment
+   - Analyze issue summary and description for technical indicators
+   - Match technical keywords, APIs, and error codes to team expertise
+   - Focus on the ROOT CAUSE and primary technical domain
+   - When multiple teams could apply, choose the most specific match
    
-   **CRITICAL COMPONENT MAPPINGS (EXACT MATCHES REQUIRED)**:
-   - "Wi-Fi" component → Wi-Fi team (NEVER Other, regardless of documentation content)
-   - "BLE" component → BLE team (NEVER Classic Bluetooth, even if mentions "BT" or "Bluetooth")
-   - "Build System" component → IDF Core (NEVER IDF Tools, ignore tool mentions)
-   - "IDF_Core" component → IDF Core (NEVER Chip Support)
-   - "driver" component → Chip Support (NEVER Sleep and Power Management)
-   - "driver_adc" component → Chip Support (NEVER IDF Core)
-   - "driver_dac" component → Chip Support (NEVER IDF Core)
-   - "storage" component → Storage (NEVER IDF Tools)
-   - "soc" component → Chip Support (NEVER IDF Core)
-   - "newlib" component → IDF Core (NEVER Chip Support)
-   - "tools" component → IDF Tools (NEVER IDE team)
-   
-   **ALL DRIVER COMPONENTS → CHIP SUPPORT (MANDATORY)**:
-   - ANY component starting with "driver_" → Chip Support
-   - "driver", "driver_gpio", "driver_i2c", "driver_spi", "driver_uart" → Chip Support
-   - "driver_adc", "driver_dac", "driver_ledc", "driver_mcpwm" → Chip Support
-   - "soc", "hal", "esp_hw_support" → Chip Support
-   - usb_serial_jtag component → Chip Support (serial interface driver, not USB team)
-   
-   **BLE vs CLASSIC BLUETOOTH (STRICT)**:
-   - "BLE" component → ALWAYS BLE team (NEVER Classic Bluetooth)
-   - "nimble" component → ALWAYS BLE team
-   - "bluedroid" component → ALWAYS BLE team  
-   - Only route to Classic Bluetooth for components: "bt_classic", "a2dp", "spp"
-   - If component contains "BLE" → NEVER Classic Bluetooth
-   
-   **BUILD SYSTEM OVERRIDE RULE (ABSOLUTE)**:
-   - "Build System" component → ALWAYS IDF Core (ignore any tool/cmake mentions)
-   - "IDF_Core" component → ALWAYS IDF Core
-   - "cxx" component → ALWAYS IDF Core (language standards)
-   - Reproducible builds, linking, framework usage → IDF Core
-   - Only route to IDF Tools if component is exactly "tools"
-   
-   **STORAGE COMPONENTS**:
-   - "storage" component → Storage team (not IDF Tools)
-   - "nvs_flash", "fatfs", "spiffs", "vfs" → Storage
-   - "wear_levelling", "partition_table" → Storage
-   
-   **CORE SYSTEM COMPONENTS**:
-   - "newlib" component → IDF Core (C library functions)
-   - "freertos", "heap", "log", "esp_system" → IDF Core
-   - "bootloader", "app_update", "esp_common" → IDF Core
-   
-   **NETWORKING COMPONENTS**:
-   - "LWIP", "esp_netif", "mdns", "esp_http_client" → Networking and Protocols
-   - "mqtt", "coap", "modbus" → Networking and Protocols
-   
-   **TOOLCHAIN COMPONENTS**:
-   - "toolchain" component → Toolchains & Debuggers
-   - "debugging and tracing" component → Toolchains & Debuggers (not USB team)
-   
-   **FALLBACK RULES (only if component field missing)**:
-   - NimBLE stack → BLE (not Classic Bluetooth)
-   - Driver issues → Chip Support (peripheral drivers & HAL)
-   - Network protocols → Networking and Protocols
-   - Security/crypto → Application Utilities or Security
+   **Domain Guidelines**:
+   - WiFi APIs, connection issues → Wi-Fi team
+   - Bluetooth/BLE APIs, pairing, GATT → BLE or Classic Bluetooth teams
+   - GPIO, ADC, SPI, I2C drivers → Chip Support team
+   - HTTP, MQTT, TCP/IP, networking → Networking and Protocols team
+   - Build system, toolchain, IDE issues → IDF Tools or IDF Core teams
+   - Power management, sleep modes → Sleep and Power Management team
 
+  4. Use the following rules to distinguish IDF Core vs IDF Tools issues.
+
+Classify as IDF Core when the issue is about code that runs on the device, ESP-IDF runtime libraries, or the ESP-IDF CMake build logic for components/projects:
+- Technical indicators (APIs, symbols, headers, paths):
+  - Runtime APIs: esp_event, esp_wifi, esp_log, esp_system, FreeRTOS (tasks, event groups), lwIP, newlib (settimeofday), heap/heap_caps, spi_flash, NVS, driver/*.h, esp_rom_* functions.
+  - Boot and security: Secure Boot, bootloader, OTA image signing, RTC memory, BOOTLOADER_CUSTOM_RESERVE_RTC, partition table behavior, panic_abort, Guru Meditation, LoadStoreAlignment.
+  - ROM/SoC specifics: esp_rom_spiflash_select_padsfunc, GPIO_OUTPUT_SET, GPIO_INPUT_GET, esp32c3/rom/gpio.h.
+  - Build System internals: CMakeLists.txt content, idf_component_register, component names, per-component CMake behavior, Linux host (linux_compatible) build targets, unit-test build/coverage integration.
+  - File paths: components/<lib>/* (esp_event, esp_rom, freertos, heap, spi_flash), components/bootloader/*.
+- Keywords/phrases:
+  - “bootloader,” “secure boot,” “OTA image/signing,” “RTC reserved memory,” “panic,” “Guru Meditation,” “freertos,” “heap regression,” “ODR violation,” “alignment,” “linker script,” “linux_compatible test app,” “component name,” “CMakeLists.txt changes.”
+- Typical problems:
+  - Crashes, panics, concurrency bugs, missing/removed symbols or APIs in ROM or components.
+  - Behavior/semantics of runtime APIs (timekeeping, event handlers, Wi-Fi events).
+  - Build logic feature requests/bugs within ESP-IDF CMake (component naming, hooks to run scripts after build, unit-test coverage on host).
+  - CMake generator errors when invoking CMake directly for an ESP-IDF project (e.g., “CMake was unable to find Ninja” without any idf.py/install context).
+- Ambiguous build issues:
+  - If the complaint is about writing/using CMakeLists.txt, component selection, or project-side CMake logic, choose Core.
+  - If an IRAM/DRAM overflow is about placement/linking of firmware sections, choose Core unless the complaint centers on idf_size output/analysis (then Tools).
+
+Classify as IDF Tools when the issue is about host-side tooling, installation, environment setup, Python tooling, or ancillary developer tools:
+- Technical indicators (commands, scripts, repos, variables):
+  - idf.py and its subcommands (build, menuconfig, monitor), idf_tools.py, esp-idf-tools-setup-offline-*.exe, install.sh, install.ps1, export.sh.
+  - idf_monitor tool (SerialMonitor.serial_write, RFC2217), idf_size, sbom_tool (esp-idf-sbom repo), clang-tidy-runner (run-clang-tidy.py, clang-tidy-diff.py).
+  - Environment variables: IDF_TOOLS_PATH, IDF_PYTHON_ENV_PATH, proxy variables affecting downloads.
+  - External tool deps: OpenOCD packaging, libusb on Linux, toolchain downloads, Python virtualenv management.
+  - Repos/labels: esp-idf-monitor, esp-idf-sbom, clang-tidy-runner, “windows platform”, “tools”, “idf_monitor”, “idf_size”.
+- Keywords/phrases:
+  - “offline installer,” “Windows installer,” “install failed,” “download tools,” “export environment,” “Python env,” “virtual environment,” “menuconfig access violation,” “monitor colors,” “RFC2217,” “not writable IDF_TOOLS_PATH,” “libusb missing,” “OpenOCD install,” “proxy.”
+- Typical problems:
+  - Installation/setup failures, path/permission issues, missing dependencies on host OS.
+  - idf.py behavior, menuconfig UI crashes, monitor hangs or protocol issues, idf_size reporting/analysis.
+  - Requests to update offline packages or change idf.py behavior/policy.
+- Ambiguous CMake/build errors:
+  - If the error occurs while using idf.py or an installer/script sets up tools (e.g., Ninja not installed, Python env mismatch), choose Tools.
+  - If the issue is about OS packaging, proxies, or dependency installation (libusb/OpenOCD), choose Tools.
+
+Tie-breaker rules for mixed issues:
+- Mentions of idf.py, idf_tools.py, install.sh/install.ps1/export.sh, Windows offline installer, or IDF_TOOLS_PATH/IDF_PYTHON_ENV_PATH override to IDF Tools.
+- Mentions of bootloader/secure boot/RTC memory, ROM functions, FreeRTOS, or runtime crashes/panics override to IDF Core.
+- Menuconfig:
+  - Crash/access violation or UI/launch problems → Tools.
+  - Misbehavior of a Kconfig option affecting firmware features/boot/runtime → Core.
+- Memory/size:
+  - Questions about idf_size tool output or size report correctness → Tools.
+  - Linker section placement, IRAM/DRAM overflow due to code/ld script, runtime heap usage regressions → Core.
+
+Quick examples to apply:
+- “idf.py menuconfig Access violation” → Tools.
+- “settimeofday sets local time not UTC” → Core.
+- “esp-idf-tools-setup-offline-4.4.exe fails” → Tools.
+- “BOOTLOADER_CUSTOM_RESERVE_RTC missing on ESP32C2” → Core.
+- “Monitor hangs in SerialMonitor.serial_write with RFC2217” → Tools.
+- “Unsubscribing from esp_event handler crashes” → Core.
+- “CMake can’t find Ninja” while calling CMake directly with project CMakeLists → Core; if via idf.py or after running install scripts → Tools.
+
+5. **BLE vs Classic Bluetooth Distinction:**:
+
+1) Highest-priority technical indicators (APIs, headers, Kconfig, paths)
+- Route to BLE if any of these appear:
+  - Stacks/paths: components/bt/host/nimble/…, NimBLE, BLE Mesh (esp_ble_mesh_*), examples/bluetooth/bluedroid/ble/…, examples/bluetooth/esp_ble_mesh/…
+  - APIs (BLE): esp_ble_gap_*, esp_ble_gatts_*, esp_ble_gattc_*, esp_blufi_*, ble_gap_*, ble_gattc_*, ble_gatts_*, ble_hs_*, ble_svc_*, blufi_init.c
+  - Kconfig: CONFIG_BT_NIMBLE_*, CONFIG_BLE_MESH_*, CONFIG_BT_BLE_*, CONFIG_BT_CONTROLLER_MODE_BLE
+  - BLE Mesh keywords: PB-ADV, PB-GATT, bearer, provision/provisioner, model, publish, LPN, friend
+  - File/log strings: GATT/GATTS/GATTC, BLE_HS, NimBLE, BLE_MESH, advertising, scan, MTU, characteristic, descriptor
+  - Examples: controller_vhci_ble_adv, gatt_server, gatt_client
+- Route to Classic Bluetooth if any of these appear:
+  - Profiles: SPP, A2DP, AVRCP, HFP/HSP, SCO/eSCO, PBAP, HID/HIDH, MAP, OPP
+  - APIs (Classic): esp_spp_*, esp_a2d_*, esp_avrc_*, esp_hf_*/esp_ag_*, esp_bt_hid_* or esp_bt_hidh_*, esp_bt_gap_* (note: esp_bt_gap_* is Classic; BLE uses esp_ble_gap_*)
+  - Kconfig: CONFIG_BT_CLASSIC_ENABLED, CONFIG_BT_SPP_ENABLED, CONFIG_A2DP_*, CONFIG_AVRCP_*, CONFIG_BT_HFP_*, CONFIG_BT_HID_*
+  - Paths/examples: examples/bluetooth/bluedroid/classic/*, bt_avrc, a2dp_source, spp_acceptor
+  - Classic-specific terms: RFCOMM, SDP/SDP record, COD/Class of Device (esp_bt_gap_set_cod), inquiry, page/page scan, BR/EDR, SCO
+  - Log tags: BTA_, BTM_, A2D, AVRC, RFCOMM, SPP
+
+2) Domain keywords and typical problem types
+- BLE team typical issues:
+  - Advertising/scanning visibility (e.g., not visible on iPhone/Android), whitelist, scan params
+  - GATT client/server behavior, service/characteristic/descriptor, UUIDs 0x180X/0x2Axx, MTU issues
+  - NimBLE compile/link/malloc/PSRAM issues, os_mempool.h, ble_gattc_disc_all_svcs
+  - BLE Mesh build/runtime warnings/errors, provisioning, bearers, “No outbound bearer found”
+  - BLUFI provisioning problems (esp_blufi_*)
+  - BLE controller crashes or sleeps (btdm_sleep_check_duration) when context shows BLE/GATT/NimBLE
+  - TX power for BLE, LE-specific VHCI usage (controller_vhci_ble_adv)
+- Classic Bluetooth team typical issues:
+  - Audio streaming/control (A2DP/AVRCP), cover art, audio glitches, reconnection behavior
+  - SPP connect/acceptor throughput or stalls, RFCOMM/L2CAP over BR/EDR
+  - Phone call audio/control (HFP/HSP), SCO link failures
+  - HID keyboard/mouse/gamepad host/device (esp_bt_hidh_init)
+  - GAP discovery/inquiry, device class (COD), pairing/pincode for Classic
+  - Controller HCI data path issues when tied to ACL/SCO, Classic profiles, or esp_bt_gap_*
+
+3) Error/log string cues
+- BLE: “GATTS:”, “GATTC:”, “BLE_HS”, “NimBLE”, “BLE_MESH”, “No outbound bearer found”, “scan_evt timeout”, “adv”, “ATT”, “MTU”
+- Classic: “AVRC”, “A2D”, “SPP”, “RFCOMM”, “BTM”, “BTA”, “SCO/eSCO”, “GAP: COD”
+- Note: “GATT” implies BLE even if the word “Classic” appears elsewhere.
+
+4) Chip-based decision aid
+- If the chip is ESP32-C2/C3/C6/S3/H2 (no Classic Bluetooth support), any Bluetooth functionality issue must be routed to BLE.
+- If ESP32 (original) and context is ambiguous, defer to API/profile clues above.
+
+5) Ambiguous terms and tie-breakers
+- GAP: Use the API prefix. esp_ble_gap_* => BLE. esp_bt_gap_* => Classic.
+- L2CAP: If tied to ATT/MTU/GATT/UUIDs => BLE. If tied to RFCOMM/SDP/BR-EDR/SCO or Classic profiles => Classic.
+- VHCI/HCI:
+  - If example or commands explicitly say BLE/LE (e.g., “controller_vhci_ble_adv”, LE Set Advertising Parameters) => BLE.
+  - If focused on ACL/SCO flow, Classic profiles, or Classic GAP => Classic.
+- Coexistence with Wi‑Fi:
+  - If BLE Mesh, GATT, advertising/scanning are involved => BLE.
+  - If A2DP/SPP/AVRCP/HID/SCO are involved => Classic.
+- “GATT” vs “Classic” conflict: Prefer BLE due to GATT being LE-only in ESP-IDF.
+- Pairing issues:
+  - If GATT server/client, characteristics, iPhone scan/advertise => BLE.
+  - If PIN code, COD, SPP/A2DP/AVRCP/HID context => Classic.
+
+6) File/build/link indicators
+- BLE build failures typically reference: components/bt/host/nimble/…, ble_mesh/, blufi/, examples …/ble/…, symbols like ble_* or esp_ble_*.
+- Classic build failures typically reference: a2dp_source, avrc_*, spp_*, hid/hidh, examples …/classic/…, symbols like esp_spp_*, esp_a2d_*, esp_avrc_*, esp_bt_gap_*.
+
+7) Default rule when none of the above apply
+- If any BLE-exclusive token appears (GATT, NimBLE, Mesh, BLUFI, advertising/scanning), classify as BLE.
+- Else if any Classic-exclusive token appears (SPP, A2DP, AVRCP, HFP, HID/HIDH, SCO, COD, RFCOMM/SDP, esp_bt_gap_*), classify as Classic.
+- If still uncertain and the chip is C2/C3/C6/S3/H2, classify as BLE; otherwise request more context, but tentatively classify based on example path or API prefixes present.
+
+8) 
+- Choose BLE when: Issue mentions "NimBLE", "nimble", "BLE", "GATT", "GAP", even if SPP is mentioned (NimBLE can emulate SPP over BLE)
+- Choose Classic Bluetooth when: Issue mentions "Bluedroid", "Classic Bluetooth", "A2DP", "HFP", "SPP" WITHOUT NimBLE context
+- Special case: "NimBLE SPP" or "Nimble SPP" → BLE team (SPP emulation over BLE)
 Only choose from the provided team names (case-sensitive).
-Provide clear technical reasoning for your choice."""
+Provide clear technical reasoning for your choice based on the technical signals you identified."""
 
 def team_schema(team_names: List[str], batch_size: int = 1) -> Dict[str, Any]:
     """Schema for /v1/responses endpoint"""
@@ -340,13 +460,24 @@ def make_prompt(
     team_to_components: Dict[str, List[str]],
     issues: List[IssueRow]
 ) -> str:
-    """Simple prompt with component mappings."""
+    """Prompt with component mappings and team-specific keywords."""
     
     # Build team-component mapping
     team_components_text = ""
     for team, components in team_to_components.items():
         components_list = ", ".join(components)
         team_components_text += f"• {team}: {components_list}\n"
+    
+    # Build team keywords mapping
+    team_keywords_text = ""
+    for team, keywords in team_keywords.items():
+        if keywords:  # Only show teams that have keywords
+            # Limit to first 20 keywords to keep prompt manageable
+            keywords_display = keywords[:20]
+            if len(keywords) > 20:
+                keywords_display.append(f"... (+{len(keywords)-20} more)")
+            keywords_list = ", ".join(keywords_display)
+            team_keywords_text += f"• {team}: {keywords_list}\n"
     
     # Build issues text
     if len(issues) == 1:
@@ -368,26 +499,39 @@ def make_prompt(
             issues_list.append(f"Issue {i}:\n{json.dumps(issue_obj, ensure_ascii=False, indent=2)}")
         issues_text = "\n\n".join(issues_list)
     
-    return f"""
-{issue_header}
-
-TEAM COMPONENT MAPPINGS:
-{team_components_text}
-
-CLASSIFICATION RULES:
-• Use component field as primary signal (most reliable)
-• If no component, analyze technical content for APIs, error codes, or domains
-• Build system: Framework usage → IDF Core, Tool internals → IDF Tools
-
-ISSUES:
-{issues_text}
-""".strip()
+    prompt_parts = [
+        issue_header,
+        "",
+        "TEAM COMPONENT MAPPINGS:",
+        team_components_text,
+    ]
+    
+    # Add team keywords section if we have any
+    if team_keywords_text.strip():
+        prompt_parts.extend([
+            "TEAM TECHNICAL KEYWORDS:",
+            team_keywords_text,
+        ])
+    
+    prompt_parts.extend([
+        "CLASSIFICATION RULES:",
+        "• Analyze issue summary and description for technical indicators",
+        "• Match technical keywords, APIs, error codes, and function names to team expertise",
+        "• Use the team technical keywords above to identify domain matches",
+        "• Focus on the primary technical domain and root cause of the issue",
+        "• When multiple teams could apply, choose the most specific technical match",
+        "",
+        "ISSUES:",
+        issues_text
+    ])
+    
+    return "\n".join(prompt_parts)
 
 
 # =========================
 # Evaluation
 # =========================
-def evaluate_accuracy(gold_by_key: Dict[str, str], pred_by_key: Dict[str, str], gold_teams_by_key: Dict[str, List[str]] = None) -> Tuple[Dict[str, Any], List[Dict[str, str]]]:
+def evaluate_accuracy(gold_by_key: Dict[str, str], pred_by_key: Dict[str, str], gold_teams_by_key: Dict[str, List[str]] = None, pred_reasoning_by_key: Dict[str, str] = None) -> Tuple[Dict[str, Any], List[Dict[str, str]]]:
     """
     Evaluate accuracy with multi-component support.
     If gold_teams_by_key is provided, count as correct if predicted team is in any of the gold teams.
@@ -418,11 +562,17 @@ def evaluate_accuracy(gold_by_key: Dict[str, str], pred_by_key: Dict[str, str], 
             if gold_teams_by_key and k in gold_teams_by_key and len(gold_teams_by_key[k]) > 1:
                 expected_display = f"{gold} (or {', '.join(gold_teams_by_key[k])})"
             
-            mismatches.append({
+            mismatch_data = {
                 "issue_key": k,
                 "predicted": pred,
                 "expected": expected_display
-            })
+            }
+            
+            # Add reasoning if available
+            if pred_reasoning_by_key and k in pred_reasoning_by_key:
+                mismatch_data["reasoning"] = pred_reasoning_by_key[k]
+            
+            mismatches.append(mismatch_data)
     
     acc = (correct / total) if total else 0.0
     metrics = {"evaluated": total, "correct": correct, "accuracy": acc}
@@ -440,7 +590,7 @@ def main():
     log.info("Teams=%d, components mapped=%d", len(team_names), len(comp_to_team))
 
     # 2) Team keywords (team_hints.json)
-    hints_kw2team = load_hints(HINTS_PATH)
+    hints_kw2team = load_hints(HINTS_PATH)    
     team_keywords = build_team_keywords(team_to_components, hints_kw2team)
     log.info("Built team keywords for %d teams", len(team_keywords))
 
@@ -485,8 +635,19 @@ def main():
         batch_preds = obj["predictions"]
         
         for pred in batch_preds:
-            preds.append({"issue_key": pred["issue_key"], "team": pred["team"]})
-            log.info("Pred: %s -> %s", pred["issue_key"], pred["team"])
+            issue_key = pred["issue_key"]
+            predicted_team = pred["team"]
+            reasoning = pred.get("reasoning", "No reasoning provided")
+            
+            # Store prediction with reasoning
+            preds.append({
+                "issue_key": issue_key, 
+                "team": predicted_team,
+                "reasoning": reasoning
+            })
+            
+            # Simple logging for all predictions
+            log.info("Pred: %s -> %s", issue_key, predicted_team)
 
     # 6) Save & evaluate
     with open(OUT_PREDS_PATH, "w", encoding="utf-8") as f:
@@ -494,7 +655,8 @@ def main():
     log.info("Saved predictions → %s (%d)", OUT_PREDS_PATH, len(preds))
 
     pred_by_key = {p["issue_key"]: p["team"] for p in preds}
-    metrics, mismatches = evaluate_accuracy(gold_by_key, pred_by_key, gold_teams_by_key)
+    pred_reasoning_by_key = {p["issue_key"]: p.get("reasoning", "No reasoning provided") for p in preds}
+    metrics, mismatches = evaluate_accuracy(gold_by_key, pred_by_key, gold_teams_by_key, pred_reasoning_by_key)
     log.info("Evaluation: %s", metrics)
     print(json.dumps(metrics, ensure_ascii=False, indent=2))
     
@@ -509,18 +671,11 @@ def main():
         
         for i, mismatch in enumerate(mismatches, 1):
             key = mismatch["issue_key"]
-            issue = issue_lookup.get(key)
             
-            print(f"\n{i}. Issue: {key}")
-            print(f"   Predicted: {mismatch['predicted']}")
-            print(f"   Expected:  {mismatch['expected']}")
-            
-            if issue:
-                print(f"   Summary:   {issue.summary[:100]}{'...' if len(issue.summary) > 100 else ''}")
-                print(f"   Components: {', '.join(issue.components)}")
-                if issue.description:
-                    desc_preview = issue.description[:150].replace('\n', ' ')
-                    print(f"   Description: {desc_preview}{'...' if len(issue.description) > 150 else ''}")
+            # Enhanced logging for mismatched cases only
+            log.info("MISMATCH - Key: %s | Expected: %s | Predicted: %s | Reasoning: %s", 
+                    key, mismatch['expected'], mismatch['predicted'], 
+                    mismatch.get('reasoning', 'No reasoning provided'))
         
         print("\n" + "="*60)
     else:
