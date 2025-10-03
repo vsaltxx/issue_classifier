@@ -206,7 +206,7 @@ Focus on:
 3. **Types of problems** each team typically handles
 4. **Clear decision rules** for ambiguous cases
 
-Generate practical, actionable instructions that can be directly added to a classification prompt."""
+Generate few-shot instructions that can be directly added to a classification prompt."""
 
     user_prompt = f"""Analyze these issue examples and generate classification instructions:
 
