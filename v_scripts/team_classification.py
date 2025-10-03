@@ -33,7 +33,7 @@ OUT_PREDS_PATH   = "predictions_teams.json"
 
 # Model
 MODEL            = os.getenv("OPENAI_MODEL", "gpt-5")
-TEST_LIMIT       = 60
+TEST_LIMIT       = 500
 SHOW_DIAGNOSTICS = True
 BATCH_SIZE       = 20  # Process N issues at once
 
@@ -222,11 +222,6 @@ def build_team_keywords(
     log.info("Built keywords for %d/%d teams, total keywords: %d", 
              teams_with_keywords, len(team_to_components), total_keywords)
     
-    # Log sample keywords for debugging
-    for team, keywords in per_team.items():
-        if keywords:
-            log.info("Team '%s': %d keywords (sample: %s)", 
-                    team, len(keywords), ", ".join(keywords[:5]))
     
     return dict(per_team)
 
@@ -262,168 +257,63 @@ def gold_team_for_issue(components: List[str], comp_to_team: Dict[str, str]) -> 
 # =========================
 # LLM schema/prompt
 # =========================
-SYSTEM_MSG = """You are an expert ESP-IDF triage assistant with deep knowledge of team responsibilities and technical domains.
+SYSTEM_MSG = """You are an ESP-IDF issue classifier. Assign exactly ONE team (from CandidateTeams) based on technical signals.
 
-Your task is to assign exactly ONE responsible team for each issue based on technical analysis of the issue content.
+HARD ANTI-"Other" GUARDRAIL:
+NEVER choose "Other" if ANY of these ESP-IDF tokens appear (case-insensitive, word-boundary):
+esp_*, ble_*, nimble, gatt, lwip, mdns, mqtt, esp_netif, http_client, http_server, ota, twai, spi, i2c, i2s, uart, rmt, usb, sdmmc, spiffs, fatfs, nvs, esp_pm, esp_sleep, bootloader, partition_table
 
-Analysis Framework:
-1. IDENTIFY technical signals in the issue:
-   - API function names (esp_wifi_*, gpio_*, nvs_*, i2c_*, etc.)
-   - Error codes (ESP_ERR_*, BLE_HS_*, specific error messages)
-   - File paths and includes (components/esp_wifi, driver/gpio, etc.)
-   - Hardware terms (GPIO pins, I2C, SPI, UART, ADC, etc.)
-   - Protocol names (HTTP, MQTT, BLE, WiFi, TCP, etc.)
-   - Technical keywords and domain-specific terms
+EXPLICIT OVERRIDES (apply before general rules):
 
-2. MATCH signals to team expertise:
-   - Use the provided team technical keywords to identify domain matches
-   - Look for specific function names, data structures, and error patterns
-   - Consider the primary technical domain and root cause
-   - Match issue symptoms to team specializations
+A) Application Utilities vs Networking & Protocols:
+→ Application Utilities: esp_http_client, esp_https_ota, esp_tls (with OTA), esp_http_server, httpd_ws, provisioning, protocomm, wifi_prov_mgr
+→ Networking & Protocols: esp_mqtt, esp_websocket_client, esp_netif, lwip, PPP, mdns, esp_modem
 
-3. APPLY classification rules:
-   - Analyze issue summary and description for technical indicators
-   - Match technical keywords, APIs, and error codes to team expertise
-   - Focus on the ROOT CAUSE and primary technical domain
-   - When multiple teams could apply, choose the most specific match
-   
-   **Domain Guidelines**:
-   - WiFi APIs, connection issues → Wi-Fi team
-   - Bluetooth/BLE APIs, pairing, GATT → BLE or Classic Bluetooth teams
-   - GPIO, ADC, SPI, I2C drivers → Chip Support team
-   - HTTP, MQTT, TCP/IP, networking → Networking and Protocols team
-   - Build system, toolchain, IDE issues → IDF Tools or IDF Core teams
-   - Power management, sleep modes → Sleep and Power Management team
+B) IDF Tools vs IDE:
+→ IDE only if: "Build, Flash and Monitor button", "ESP-IDF: Doctor", extension settings, .vscode/launch.json, IntelliSense/indexer
+→ IDF Tools: default even if VS Code mentioned
 
-  4. Use the following rules to distinguish IDF Core vs IDF Tools issues.
+C) IDF Core vs IDF Tools:
+→ IDF Core: idf_component_register, CMakeLists.txt, linker script, Guru Meditation, panic, esp_system, bootloader, partition_table, settimeofday, newlib, heap_caps, freertos
+→ IDF Tools: install.sh/.ps1, offline installer, idf_tools.py, OpenOCD/libusb, Python venv, idf.py UX
 
-Classify as IDF Core when the issue is about code that runs on the device, ESP-IDF runtime libraries, or the ESP-IDF CMake build logic for components/projects:
-- Technical indicators (APIs, symbols, headers, paths):
-  - Runtime APIs: esp_event, esp_wifi, esp_log, esp_system, FreeRTOS (tasks, event groups), lwIP, newlib (settimeofday), heap/heap_caps, spi_flash, NVS, driver/*.h, esp_rom_* functions.
-  - Boot and security: Secure Boot, bootloader, OTA image signing, RTC memory, BOOTLOADER_CUSTOM_RESERVE_RTC, partition table behavior, panic_abort, Guru Meditation, LoadStoreAlignment.
-  - ROM/SoC specifics: esp_rom_spiflash_select_padsfunc, GPIO_OUTPUT_SET, GPIO_INPUT_GET, esp32c3/rom/gpio.h.
-  - Build System internals: CMakeLists.txt content, idf_component_register, component names, per-component CMake behavior, Linux host (linux_compatible) build targets, unit-test build/coverage integration.
-  - File paths: components/<lib>/* (esp_event, esp_rom, freertos, heap, spi_flash), components/bootloader/*.
-- Keywords/phrases:
-  - “bootloader,” “secure boot,” “OTA image/signing,” “RTC reserved memory,” “panic,” “Guru Meditation,” “freertos,” “heap regression,” “ODR violation,” “alignment,” “linker script,” “linux_compatible test app,” “component name,” “CMakeLists.txt changes.”
-- Typical problems:
-  - Crashes, panics, concurrency bugs, missing/removed symbols or APIs in ROM or components.
-  - Behavior/semantics of runtime APIs (timekeeping, event handlers, Wi-Fi events).
-  - Build logic feature requests/bugs within ESP-IDF CMake (component naming, hooks to run scripts after build, unit-test coverage on host).
-  - CMake generator errors when invoking CMake directly for an ESP-IDF project (e.g., “CMake was unable to find Ninja” without any idf.py/install context).
-- Ambiguous build issues:
-  - If the complaint is about writing/using CMakeLists.txt, component selection, or project-side CMake logic, choose Core.
-  - If an IRAM/DRAM overflow is about placement/linking of firmware sections, choose Core unless the complaint centers on idf_size output/analysis (then Tools).
+D) Sleep & Power vs Chip Support:
+→ Sleep & Power: esp_sleep_*, esp_pm_*, deep sleep, light sleep, DFS, wakeup, ULP, RTC GPIO, APB/CPU freq
+→ Chip Support: peripheral drivers (SPI/I2C/UART/I2S/RMT/ADC/LCD/SD) even with watchdog
 
-Classify as IDF Tools when the issue is about host-side tooling, installation, environment setup, Python tooling, or ancillary developer tools:
-- Technical indicators (commands, scripts, repos, variables):
-  - idf.py and its subcommands (build, menuconfig, monitor), idf_tools.py, esp-idf-tools-setup-offline-*.exe, install.sh, install.ps1, export.sh.
-  - idf_monitor tool (SerialMonitor.serial_write, RFC2217), idf_size, sbom_tool (esp-idf-sbom repo), clang-tidy-runner (run-clang-tidy.py, clang-tidy-diff.py).
-  - Environment variables: IDF_TOOLS_PATH, IDF_PYTHON_ENV_PATH, proxy variables affecting downloads.
-  - External tool deps: OpenOCD packaging, libusb on Linux, toolchain downloads, Python virtualenv management.
-  - Repos/labels: esp-idf-monitor, esp-idf-sbom, clang-tidy-runner, “windows platform”, “tools”, “idf_monitor”, “idf_size”.
-- Keywords/phrases:
-  - “offline installer,” “Windows installer,” “install failed,” “download tools,” “export environment,” “Python env,” “virtual environment,” “menuconfig access violation,” “monitor colors,” “RFC2217,” “not writable IDF_TOOLS_PATH,” “libusb missing,” “OpenOCD install,” “proxy.”
-- Typical problems:
-  - Installation/setup failures, path/permission issues, missing dependencies on host OS.
-  - idf.py behavior, menuconfig UI crashes, monitor hangs or protocol issues, idf_size reporting/analysis.
-  - Requests to update offline packages or change idf.py behavior/policy.
-- Ambiguous CMake/build errors:
-  - If the error occurs while using idf.py or an installer/script sets up tools (e.g., Ninja not installed, Python env mismatch), choose Tools.
-  - If the issue is about OS packaging, proxies, or dependency installation (libusb/OpenOCD), choose Tools.
+E) USB cases:
+→ USB: usb_device/usb_host/TinyUSB
+→ IDF Core: usb_serial_jtag console, CDC console, console reboot
 
-Tie-breaker rules for mixed issues:
-- Mentions of idf.py, idf_tools.py, install.sh/install.ps1/export.sh, Windows offline installer, or IDF_TOOLS_PATH/IDF_PYTHON_ENV_PATH override to IDF Tools.
-- Mentions of bootloader/secure boot/RTC memory, ROM functions, FreeRTOS, or runtime crashes/panics override to IDF Core.
-- Menuconfig:
-  - Crash/access violation or UI/launch problems → Tools.
-  - Misbehavior of a Kconfig option affecting firmware features/boot/runtime → Core.
-- Memory/size:
-  - Questions about idf_size tool output or size report correctness → Tools.
-  - Linker section placement, IRAM/DRAM overflow due to code/ld script, runtime heap usage regressions → Core.
+F) BLE vs Classic:
+→ BLE: GATT, NimBLE, BLE_MESH, esp_blufi_*, protocomm_nimble
+→ Classic: SPP, A2DP, AVRCP, HFP, HID/HIDH, RFCOMM, esp_bt_gap_*
 
-Quick examples to apply:
-- “idf.py menuconfig Access violation” → Tools.
-- “settimeofday sets local time not UTC” → Core.
-- “esp-idf-tools-setup-offline-4.4.exe fails” → Tools.
-- “BOOTLOADER_CUSTOM_RESERVE_RTC missing on ESP32C2” → Core.
-- “Monitor hangs in SerialMonitor.serial_write with RFC2217” → Tools.
-- “Unsubscribing from esp_event handler crashes” → Core.
-- “CMake can’t find Ninja” while calling CMake directly with project CMakeLists → Core; if via idf.py or after running install scripts → Tools.
+G) Wi-Fi vs Networking:
+→ Wi-Fi: esp_wifi_* APIs, driver issues
+→ Networking: esp_netif, lwip, mdns, sockets, PPP, protocol clients
 
-5. **BLE vs Classic Bluetooth Distinction:**:
+H) Storage/VFS:
+→ Chip Support: VFS for UART (esp_vfs_dev, line endings)
+→ IDF Core: partition table, boot image
+→ IDF Tools: filesystem tools (generate/preprogram images)
 
-1) Highest-priority technical indicators (APIs, headers, Kconfig, paths)
-- Route to BLE if any of these appear:
-  - Stacks/paths: components/bt/host/nimble/…, NimBLE, BLE Mesh (esp_ble_mesh_*), examples/bluetooth/bluedroid/ble/…, examples/bluetooth/esp_ble_mesh/…
-  - APIs (BLE): esp_ble_gap_*, esp_ble_gatts_*, esp_ble_gattc_*, esp_blufi_*, ble_gap_*, ble_gattc_*, ble_gatts_*, ble_hs_*, ble_svc_*, blufi_init.c
-  - Kconfig: CONFIG_BT_NIMBLE_*, CONFIG_BLE_MESH_*, CONFIG_BT_BLE_*, CONFIG_BT_CONTROLLER_MODE_BLE
-  - BLE Mesh keywords: PB-ADV, PB-GATT, bearer, provision/provisioner, model, publish, LPN, friend
-  - File/log strings: GATT/GATTS/GATTC, BLE_HS, NimBLE, BLE_MESH, advertising, scan, MTU, characteristic, descriptor
-  - Examples: controller_vhci_ble_adv, gatt_server, gatt_client
-- Route to Classic Bluetooth if any of these appear:
-  - Profiles: SPP, A2DP, AVRCP, HFP/HSP, SCO/eSCO, PBAP, HID/HIDH, MAP, OPP
-  - APIs (Classic): esp_spp_*, esp_a2d_*, esp_avrc_*, esp_hf_*/esp_ag_*, esp_bt_hid_* or esp_bt_hidh_*, esp_bt_gap_* (note: esp_bt_gap_* is Classic; BLE uses esp_ble_gap_*)
-  - Kconfig: CONFIG_BT_CLASSIC_ENABLED, CONFIG_BT_SPP_ENABLED, CONFIG_A2DP_*, CONFIG_AVRCP_*, CONFIG_BT_HFP_*, CONFIG_BT_HID_*
-  - Paths/examples: examples/bluetooth/bluedroid/classic/*, bt_avrc, a2dp_source, spp_acceptor
-  - Classic-specific terms: RFCOMM, SDP/SDP record, COD/Class of Device (esp_bt_gap_set_cod), inquiry, page/page scan, BR/EDR, SCO
-  - Log tags: BTA_, BTM_, A2D, AVRC, RFCOMM, SPP
+CLASSIFICATION PROCESS:
+1. Apply EXPLICIT OVERRIDES first (A-H above)
+2. Check API prefixes: esp_ble_*/ble_*/nimble → BLE; esp_wifi_* → Wi-Fi; gpio_*/i2c_*/spi_*/uart_* → Chip Support; etc.
+3. Look for component paths and build tokens
+4. Use domain context as fallback
 
-2) Domain keywords and typical problem types
-- BLE team typical issues:
-  - Advertising/scanning visibility (e.g., not visible on iPhone/Android), whitelist, scan params
-  - GATT client/server behavior, service/characteristic/descriptor, UUIDs 0x180X/0x2Axx, MTU issues
-  - NimBLE compile/link/malloc/PSRAM issues, os_mempool.h, ble_gattc_disc_all_svcs
-  - BLE Mesh build/runtime warnings/errors, provisioning, bearers, “No outbound bearer found”
-  - BLUFI provisioning problems (esp_blufi_*)
-  - BLE controller crashes or sleeps (btdm_sleep_check_duration) when context shows BLE/GATT/NimBLE
-  - TX power for BLE, LE-specific VHCI usage (controller_vhci_ble_adv)
-- Classic Bluetooth team typical issues:
-  - Audio streaming/control (A2DP/AVRCP), cover art, audio glitches, reconnection behavior
-  - SPP connect/acceptor throughput or stalls, RFCOMM/L2CAP over BR/EDR
-  - Phone call audio/control (HFP/HSP), SCO link failures
-  - HID keyboard/mouse/gamepad host/device (esp_bt_hidh_init)
-  - GAP discovery/inquiry, device class (COD), pairing/pincode for Classic
-  - Controller HCI data path issues when tied to ACL/SCO, Classic profiles, or esp_bt_gap_*
+SPECIAL CASES:
+• ESP32-C2/C3/C6/S3/H2 + Bluetooth → BLE (no Classic support)
+• "NimBLE SPP" → BLE
+• Component manager dependency issues → IDF Tools; runtime protocol behavior → Networking
 
-3) Error/log string cues
-- BLE: “GATTS:”, “GATTC:”, “BLE_HS”, “NimBLE”, “BLE_MESH”, “No outbound bearer found”, “scan_evt timeout”, “adv”, “ATT”, “MTU”
-- Classic: “AVRC”, “A2D”, “SPP”, “RFCOMM”, “BTM”, “BTA”, “SCO/eSCO”, “GAP: COD”
-- Note: “GATT” implies BLE even if the word “Classic” appears elsewhere.
+OUTPUT (JSON only):
+{"predictions":[{"issue_key":"<key>","team":"<exact team name>","reasoning":"Brief rationale with key signals"}]}
+"""
 
-4) Chip-based decision aid
-- If the chip is ESP32-C2/C3/C6/S3/H2 (no Classic Bluetooth support), any Bluetooth functionality issue must be routed to BLE.
-- If ESP32 (original) and context is ambiguous, defer to API/profile clues above.
 
-5) Ambiguous terms and tie-breakers
-- GAP: Use the API prefix. esp_ble_gap_* => BLE. esp_bt_gap_* => Classic.
-- L2CAP: If tied to ATT/MTU/GATT/UUIDs => BLE. If tied to RFCOMM/SDP/BR-EDR/SCO or Classic profiles => Classic.
-- VHCI/HCI:
-  - If example or commands explicitly say BLE/LE (e.g., “controller_vhci_ble_adv”, LE Set Advertising Parameters) => BLE.
-  - If focused on ACL/SCO flow, Classic profiles, or Classic GAP => Classic.
-- Coexistence with Wi‑Fi:
-  - If BLE Mesh, GATT, advertising/scanning are involved => BLE.
-  - If A2DP/SPP/AVRCP/HID/SCO are involved => Classic.
-- “GATT” vs “Classic” conflict: Prefer BLE due to GATT being LE-only in ESP-IDF.
-- Pairing issues:
-  - If GATT server/client, characteristics, iPhone scan/advertise => BLE.
-  - If PIN code, COD, SPP/A2DP/AVRCP/HID context => Classic.
-
-6) File/build/link indicators
-- BLE build failures typically reference: components/bt/host/nimble/…, ble_mesh/, blufi/, examples …/ble/…, symbols like ble_* or esp_ble_*.
-- Classic build failures typically reference: a2dp_source, avrc_*, spp_*, hid/hidh, examples …/classic/…, symbols like esp_spp_*, esp_a2d_*, esp_avrc_*, esp_bt_gap_*.
-
-7) Default rule when none of the above apply
-- If any BLE-exclusive token appears (GATT, NimBLE, Mesh, BLUFI, advertising/scanning), classify as BLE.
-- Else if any Classic-exclusive token appears (SPP, A2DP, AVRCP, HFP, HID/HIDH, SCO, COD, RFCOMM/SDP, esp_bt_gap_*), classify as Classic.
-- If still uncertain and the chip is C2/C3/C6/S3/H2, classify as BLE; otherwise request more context, but tentatively classify based on example path or API prefixes present.
-
-8) 
-- Choose BLE when: Issue mentions "NimBLE", "nimble", "BLE", "GATT", "GAP", even if SPP is mentioned (NimBLE can emulate SPP over BLE)
-- Choose Classic Bluetooth when: Issue mentions "Bluedroid", "Classic Bluetooth", "A2DP", "HFP", "SPP" WITHOUT NimBLE context
-- Special case: "NimBLE SPP" or "Nimble SPP" → BLE team (SPP emulation over BLE)
-Only choose from the provided team names (case-sensitive).
-Provide clear technical reasoning for your choice based on the technical signals you identified."""
 
 def team_schema(team_names: List[str], batch_size: int = 1) -> Dict[str, Any]:
     """Schema for /v1/responses endpoint"""
@@ -460,7 +350,7 @@ def make_prompt(
     team_to_components: Dict[str, List[str]],
     issues: List[IssueRow]
 ) -> str:
-    """Prompt with component mappings and team-specific keywords."""
+    """Prompt with component mappings, keywords, and contrastive examples."""
     
     # Build team-component mapping
     team_components_text = ""
@@ -468,16 +358,78 @@ def make_prompt(
         components_list = ", ".join(components)
         team_components_text += f"• {team}: {components_list}\n"
     
-    # Build team keywords mapping
+    # Build team keywords mapping (condensed)
     team_keywords_text = ""
     for team, keywords in team_keywords.items():
         if keywords:  # Only show teams that have keywords
-            # Limit to first 20 keywords to keep prompt manageable
-            keywords_display = keywords[:20]
-            if len(keywords) > 20:
-                keywords_display.append(f"... (+{len(keywords)-20} more)")
+            # Limit to first 10 keywords to keep prompt manageable
+            keywords_display = keywords[:10]
+            if len(keywords) > 10:
+                keywords_display.append(f"... (+{len(keywords)-10} more)")
             keywords_list = ", ".join(keywords_display)
             team_keywords_text += f"• {team}: {keywords_list}\n"
+    
+    # Contrastive few-shot examples
+    examples_text = """CONTRASTIVE EXAMPLES:
+
+**IDF Tools vs IDE:**
+• "idf.py build fails with CMake error" + Terminal usage → IDF Tools
+• "ESP-IDF VS Code extension setup failing" → IDE (extension issue)
+• "Build, Flash and Monitor button fails" + VS Code extension → IDE
+
+**IDF Core vs IDF Tools:**
+• "CMakeLists.txt: idf_component_register() missing argument" → IDF Core  
+• "install.sh fails to download toolchain" → IDF Tools
+
+**BLE vs Classic Bluetooth:**
+• "GATT server MTU negotiation fails" + esp_ble_gatts_* → BLE
+• "Missing esp_bt_defs.h in BT component" → BLE (shared BT headers)
+• "A2DP audio streaming drops connection" + esp_a2d_* → Classic Bluetooth
+• "NimBLE SPP server example doesn't work" → BLE (SPP over BLE)
+
+**Sleep and Power Management vs Chip Support:**
+• "esp_deep_sleep_start() doesn't wake on GPIO" → Sleep and Power Management
+• "gpio_wakeup_enable() not working" → Chip Support (GPIO driver API)
+• "DFS affecting LEDC frequency" → Chip Support (peripheral driver issue)
+• "Power consumption high in light sleep" → Sleep and Power Management
+
+**Networking and Protocols vs IDF Tools:**
+• "MQTT client disconnects randomly" + esp_mqtt_client_* → Networking and Protocols
+• "Component manager can't resolve 'mdns' dependency" → Networking and Protocols
+• "idf.py monitor crashes when device sends data" → IDF Tools
+
+**Toolchains & Debuggers vs IDF Tools:**
+• "Request M1-native toolchain support" → Toolchains & Debuggers
+• "Question about C/C++ language standards used by IDF" → Toolchains & Debuggers
+• "Integrate clangd v19 into tools.json" → Toolchains & Debuggers
+• "idf.py build fails with CMake error" → IDF Tools
+
+**IDF Core vs IDF Tools (Build System):**
+• "Reproducible builds affected by esptool.py" → IDF Core (build system internals)
+• "Builds failing offline due to dependency fetching" → IDF Core (build system)
+• "Undocumented change causing build failures" → IDF Core (API/build changes)
+• "idf.py command not found" → IDF Tools (tool installation)
+
+**IDF Core vs Other (Documentation):**
+• "Typo in documentation fixture docstring" → Other
+• "Misleading function description in docs" → Other  
+• "Request to document known broken items" → Other
+
+**Other vs Component Teams:**
+• "Question about using external library (iconv) with ESP-IDF" → IDF Core (integration)
+• "Android ANCS notifications guidance" → Other (pure guidance)
+• "Misleading API description for specific component" → Chip Support (component docs)
+• "HTTP reboot feature request for ESP-IDF" → Application Utilities (HTTP features)
+• "Component path moved in minor release" → Networking and Protocols (component affected)
+• "TWAI driver TX/RX issues" → Chip Support (driver functionality)
+
+**USB vs Toolchains & Debuggers:**
+• "Wrong JTAG USB PID under USB bridge" → USB (USB device/descriptor)
+• "GDB debugging over JTAG" → Toolchains & Debuggers
+
+**Wi-Fi vs Networking:**
+• "esp_wifi_connect() returns ESP_FAIL" → Wi-Fi
+• "HTTP client SSL handshake fails" + esp_http_client_* → Networking and Protocols"""
     
     # Build issues text
     if len(issues) == 1:
@@ -514,12 +466,7 @@ def make_prompt(
         ])
     
     prompt_parts.extend([
-        "CLASSIFICATION RULES:",
-        "• Analyze issue summary and description for technical indicators",
-        "• Match technical keywords, APIs, error codes, and function names to team expertise",
-        "• Use the team technical keywords above to identify domain matches",
-        "• Focus on the primary technical domain and root cause of the issue",
-        "• When multiple teams could apply, choose the most specific technical match",
+        examples_text,
         "",
         "ISSUES:",
         issues_text
@@ -587,10 +534,11 @@ def main():
     # 1) Mapping from GitLab YAML
     doc = fetch_components_yaml()
     team_names, comp_to_team, team_to_components = build_team_maps(doc)
+    
     log.info("Teams=%d, components mapped=%d", len(team_names), len(comp_to_team))
 
     # 2) Team keywords (team_hints.json)
-    hints_kw2team = load_hints(HINTS_PATH)    
+    hints_kw2team = load_hints(HINTS_PATH)
     team_keywords = build_team_keywords(team_to_components, hints_kw2team)
     log.info("Built team keywords for %d teams", len(team_keywords))
 
@@ -665,9 +613,6 @@ def main():
         print("\n" + "="*60)
         print(f"MISMATCHED CLASSIFICATIONS ({len(mismatches)} issues)")
         print("="*60)
-        
-        # Find the original issue data for context
-        issue_lookup = {issue.issue_key: issue for issue in issues}
         
         for i, mismatch in enumerate(mismatches, 1):
             key = mismatch["issue_key"]

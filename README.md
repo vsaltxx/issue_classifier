@@ -105,6 +105,57 @@ Loaded: 16 teams, 132 component mappings
   - Significant improvement: 87.4% → 92.6% (+5.2 percentage points)
   - Remaining 7 mismatches are edge cases requiring deeper analysis
 
+### 2025-10-03-1 — Detailed Team Distinction Rules Experiment (teams)
+- **Model:** `gpt-5`
+- **Train/Test:** `100 samples`
+- **Prompt features:** `generated extremely detailed distinguishing rules between specific team pairs (BLE vs Classic Bluetooth, IDF Tools vs IDE, Sleep vs Chip Support, etc.), comprehensive technical indicators, extensive API lists, file path patterns, error code mappings`
+- **Result:** `accuracy decreased significantly`
+- **Observations:** 
+  - **Failed experiment**: Generated detailed distinction rules for team pairs using comprehensive technical analysis
+  - Model became overwhelmed by the excessive detail and rule complexity
+  - Accuracy dropped compared to simpler, more focused approaches
+  - **Key learning**: More detailed rules ≠ better performance; concise, high-signal rules work better
+  - Led to pivot toward few-shot contrastive examples instead of verbose rule sets
+
+### 2025-10-03-2 — Concise System + Few-Shot Examples (teams)
+- **Model:** `gpt-5`
+- **Train/Test:** `100 samples`
+- **Prompt features:** `concise system message (≤300 tokens), contrastive few-shot examples for tough boundaries, removed "Other" team option, optional reasoning field, mdns component dependency fix`
+- **Result:** `accuracy = 0.937`
+- **Observations:** 
+  - Reduced system message from ~2000+ to ~200 tokens with core API prefix rules only
+  - Added 15 contrastive examples for key team boundaries (Tools vs IDE, Core vs Tools, BLE vs Classic, etc.)
+  - Fixed IDFGH-11204 mdns dependency issue with specific example
+  - Removed "Other" team forcing more precise classification
+  - **Major improvement**: 86.3% → 93.7% (+7.4 percentage points) after mismatch analysis
+  - Only 6 remaining mismatches, mostly edge cases with "Other" predictions
+
+### 2025-10-03-3 — Priority-Based Classification with Component Matching (teams)
+- **Model:** `gpt-5`
+- **Train/Test:** `500 samples`
+- **Prompt features:** `priority-based decision framework (P1-P5), exact component name matching with word boundaries, anti-"Other" guardrails, structured API prefix hierarchy, path/config/error pattern matching, JSON-only output format`
+- **Result:** `accuracy = 0.856`
+- **Observations:** 
+  - **Regression**: 93.7% → 85.6% (-8.1 percentage points) despite more sophisticated approach
+  - Implemented P0 component name matching with constraints for weak/umbrella terms
+  - Added strict priority hierarchy: Component names → API prefixes → Paths → Config → Errors → Context
+  - Expanded test set to 500 samples revealing more edge cases (69 mismatches)
+  - **Key insight**: More complex priority systems can hurt performance vs simpler approaches
+  - Many mismatches show boundary confusion: esp_http_* (App Utilities vs Networking), USB vs Chip Support, build system ownership
+
+### 2025-10-03-4 — Hard Guardrails + Explicit Overrides (teams)
+- **Model:** `gpt-5`
+- **Train/Test:** `500 samples`
+- **Prompt features:** `hard anti-"Other" guardrail with ESP-IDF token list, 8 explicit override rules for major confusion pairs, simplified classification process (overrides → API prefixes → paths → context), targeted fixes for App Utils vs Networking, IDF Tools vs IDE, Core vs Tools boundaries`
+- **Result:** `accuracy = 0.860`
+- **Observations:** 
+  - **Marginal improvement**: 85.6% → 86.0% (+0.4 percentage points)
+  - Reduced mismatches from 69 to 67 issues
+  - Hard guardrail prevents false "Other" classifications when ESP-IDF tokens present
+  - Explicit overrides address systematic confusion pairs but limited impact
+  - **Key learning**: Targeted fixes help but major accuracy gains require different approaches
+  - Remaining 67 mismatches suggest need for more fundamental classification strategy changes
+
 
 
 ## Log template:
